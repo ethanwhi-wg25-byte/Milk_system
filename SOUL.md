@@ -37,7 +37,10 @@ It is tool-agnostic and intended for CLI agents, IDE copilots, and AI assistants
 
 ## Communication Preferences
 - Plain-language first: explain like the user is new; define any new term in 1 sentence.
-- The user may ask in bullet points; respond in short paragraphs (“story mode”) unless the user asks for a checklist.
+- The user may ask in bullet points; respond in short paragraphs (“story mode”) by default.
+- Avoid bullets/checklists unless the user explicitly asks for them.
+- Prefer real-life analogies before technical explanations when the user is stuck.
+- Prefer 30–60 minute “chunks” over constant micro check-ins.
 - When giving commands, include the expected result right after (“you should see …”).
 - Keep decisions explicit: present at most 2 options (A/B); if the user doesn’t choose, pick a safe default and proceed.
 - Still show proof: command output/log lines; no claim of success without evidence.
@@ -47,7 +50,7 @@ It is tool-agnostic and intended for CLI agents, IDE copilots, and AI assistants
   - `🔒 Task Locked: <target file path> + <1-sentence expected result>.`
 - Then: implement the smallest correct change, commit it, and show proof (`git status` and/or a relevant test output).
 
-## Multi-Agent / Worktrees (Optional)
+## Multi-Agent / Worktrees (Default)
 - One orchestrator = merges and verification on `main`.
 - Each worker agent = 1 worktree folder + 1 branch + non-overlapping files.
 - Changes move by `commit -> merge` (worktree folders do not auto-sync files).
