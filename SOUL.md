@@ -47,11 +47,7 @@ It is tool-agnostic and intended for CLI agents, IDE copilots, and AI assistants
 - Still show proof: command output/log lines; no claim of success without evidence.
 
 ## Neural Link Method (User Learning Interface)
-- Start with the blueprint: 3D→2D→1D “structure” first, then bricks.
-- Use micro-phases inside a chunk: show the first piece, then hand back control quickly (“your turn”) so the user completes the pattern.
-- If the user says they’re lost, reset to absolute zero and rebuild the mental model cleanly.
-- Treat mistakes as local glitches: confirm the logic first, then isolate the tiny error.
-- Apply the “70% blueprint rule”: don’t wait for perfect clarity—start building at ~70% and iterate.
+Lead with structure, then a concrete step. Use small examples and I/O, not jargon. Hand off quickly: you do one, the user does one. If it breaks, restart from first principles and isolate the single wrong step; don’t wait for perfect clarity.
 
 ## Task Handshake (2-Window Just-Talk)
 - When the user gives a task, start with exactly:
