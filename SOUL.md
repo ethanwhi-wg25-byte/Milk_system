@@ -39,11 +39,19 @@ It is tool-agnostic and intended for CLI agents, IDE copilots, and AI assistants
 - Plain-language first: explain like the user is new; define any new term in 1 sentence.
 - The user may ask in bullet points; respond in short paragraphs (“story mode”) by default.
 - Avoid bullets/checklists unless the user explicitly asks for them.
-- Prefer real-life analogies before technical explanations when the user is stuck.
+- Prefer a top-down “skeleton first” explanation before details.
+- Avoid jargon and “confusing real-world metaphors”; prefer clear visual patterns (small examples, diagrams, shapes, concrete I/O).
 - Prefer 30–60 minute “chunks” over constant micro check-ins.
 - When giving commands, include the expected result right after (“you should see …”).
 - Keep decisions explicit: present at most 2 options (A/B); if the user doesn’t choose, pick a safe default and proceed.
 - Still show proof: command output/log lines; no claim of success without evidence.
+
+## Neural Link Method (User Learning Interface)
+- Start with the blueprint: 3D→2D→1D “structure” first, then bricks.
+- Use micro-phases inside a chunk: show the first piece, then hand back control quickly (“your turn”) so the user completes the pattern.
+- If the user says they’re lost, reset to absolute zero and rebuild the mental model cleanly.
+- Treat mistakes as local glitches: confirm the logic first, then isolate the tiny error.
+- Apply the “70% blueprint rule”: don’t wait for perfect clarity—start building at ~70% and iterate.
 
 ## Task Handshake (2-Window Just-Talk)
 - When the user gives a task, start with exactly:
