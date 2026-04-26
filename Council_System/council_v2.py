@@ -90,7 +90,7 @@ class IronLaws:
     MAX_LEVERAGE: float = 10.0
     MAX_POSITION: float = 0.15          # fraction of equity
     STOP_LOSS_MODE: str = "server"      # required
-    MIN_CONFIDENCE: float = 0.60
+    MIN_CONFIDENCE: float = 0.75
     MIN_PROFIT_MULT: float = 2.0        # profit >= 2 * cost
 
     # Ops guardrails
@@ -147,7 +147,7 @@ class CouncilConfig:
     symbol: str = "BTC/USDT"
     timeframe_sec: int = 60
     candle_lookback: int = 180
-    min_agents_agree: int = 3
+    min_agents_agree: int = 4
     seed: int = 42
 
 

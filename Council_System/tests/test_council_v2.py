@@ -523,5 +523,26 @@ class TestRemovedAgents(unittest.TestCase):
         )
 
 
+class IronLawsStrictDefaultsTests(unittest.TestCase):
+    """After cutting weak agents, the law floor must return to production strict."""
+
+    def test_iron_laws_min_confidence_is_strict_production_default(self):
+        laws = council_v2.IronLaws()
+        self.assertEqual(
+            laws.MIN_CONFIDENCE,
+            0.75,
+            "MIN_CONFIDENCE was lowered to 0.60 to let chart-derived agents pass. "
+            "After Contrarian/MeanReversion/SignalMemory removal the strict 0.75 floor must be restored.",
+        )
+
+    def test_council_config_min_agents_agree_is_four(self):
+        cfg = council_v2.CouncilConfig()
+        self.assertEqual(
+            cfg.min_agents_agree,
+            4,
+            "min_agents_agree default was lowered to 3 for the same reason; restore 4 with the 5-agent system.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
