@@ -1,0 +1,855 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Council Agent System — MVP (paper trading)
+
+Implements Algorithm 1-style loop:
+- Collect agent verdicts
+- Judge consensus
+- MIN_CONFIDENCE gate
+- PhilosophyGuardian gate (Five Iron Laws)
+- Cooling period gate
+- Execute (paper)
+
+Design goals:
+- Deterministic, auditable, low action-rate by default.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import math
+import os
+import random
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+
+# -----------------------------
+# Domain models
+# -----------------------------
+class Action(str, Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+    HOLD = "HOLD"
+
+
+@dataclass
+class MarketSnapshot:
+    symbol: str
+    ts: int
+    price: float
+    ohlcv: List[Tuple[int, float, float, float, float, float]]  # (ts, o, h, l, c, v)
+
+
+@dataclass
+class Verdict:
+    agent: str
+    action: Action
+    confidence: float  # 0..1
+    rationale: str
+    size_hint: float = 1.0  # relative suggestion (0..1)
+
+
+@dataclass
+class Consensus:
+    action: Action
+    confidence: float
+    agree_count: int
+    total_agents: int
+    agreement_ratio: float
+    notes: List[str]
+    raw: List[Verdict]
+
+
+@dataclass
+class IronLaws:
+    MAX_LEVERAGE: float = 10.0
+    MAX_POSITION: float = 0.15          # fraction of equity
+    STOP_LOSS_MODE: str = "server"      # require "server"
+    MIN_CONFIDENCE: float = 0.75
+    MIN_PROFIT_MULT: float = 3.0        # profit >= 3 * cost
+    COOLING_PERIOD_SEC: int = 24 * 3600
+    DAILY_TRADE_LIMIT: int = 3
+
+
+@dataclass
+class Fees:
+    taker_fee: float = 0.0006  # 0.06% default (USDT-M taker)
+    maker_fee: float = 0.0002  # 0.02%
+
+
+@dataclass
+class RiskConfig:
+    initial_leverage: float = 1.0
+    rr_target: float = 3.0
+    max_drawdown_soft: float = 0.03
+    max_drawdown_hard: float = 0.08
+    vol_lookback: int = 30
+
+
+@dataclass
+class CouncilConfig:
+    symbol: str = "BTC/USDT"
+    timeframe_sec: int = 60
+    candle_lookback: int = 120
+    min_agents_agree: int = 4
+    action_rate_soft_target: float = 0.05  # monitor only
+    seed: int = 42
+
+
+@dataclass
+class TradePlan:
+    action: Action
+    symbol: str
+    leverage: float
+    position_frac: float   # fraction of equity
+    entry: float
+    stop: float
+    take: float
+    stoploss_mode: str
+    expected_profit: float
+    expected_cost: float
+
+
+@dataclass
+class Position:
+    action: Action
+    entry: float
+    qty: float
+    stop: float
+    take: float
+    leverage: float
+    opened_ts: int
+
+
+@dataclass
+class PortfolioState:
+    equity: float = 1000.0
+    cash: float = 1000.0
+    position: Optional[Position] = None
+    high_watermark: float = 1000.0
+    last_trade_ts: int = 0
+    trades_in_last_24h: List[int] = dataclasses.field(default_factory=list)
+
+
+# -----------------------------
+# Utilities: indicators (no deps)
+# -----------------------------
+def ema(values: List[float], period: int) -> float:
+    if not values or period <= 0:
+        return float("nan")
+    k = 2 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def stdev(values: List[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    m = sum(values) / len(values)
+    var = sum((x - m) ** 2 for x in values) / (len(values) - 1)
+    return math.sqrt(var)
+
+
+def bollinger(values: List[float], period: int = 20, k: float = 2.0) -> Tuple[float, float, float]:
+    if len(values) < period:
+        m = sum(values) / max(1, len(values))
+        return (m, m, m)
+    window = values[-period:]
+    m = sum(window) / period
+    sd = stdev(window)
+    return (m - k * sd, m, m + k * sd)
+
+
+def atr(ohlcv: List[Tuple[int, float, float, float, float, float]], period: int = 14) -> float:
+    if len(ohlcv) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(ohlcv)):
+        _, _, h, l, c, _ = ohlcv[i]
+        _, _, _, _, prev_c, _ = ohlcv[i - 1]
+        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+        trs.append(tr)
+    window = trs[-period:] if len(trs) >= period else trs
+    return sum(window) / max(1, len(window))
+
+
+def realized_vol(prices: List[float]) -> float:
+    if len(prices) < 3:
+        return 0.0
+    rets = []
+    for i in range(1, len(prices)):
+        if prices[i - 1] <= 0:
+            continue
+        rets.append(math.log(prices[i] / prices[i - 1]))
+    return stdev(rets)
+
+
+def pivot_levels(ohlcv: List[Tuple[int, float, float, float, float, float]]) -> Tuple[float, float]:
+    # Simple pivot: use last candle's H/L/C
+    if not ohlcv:
+        return (float("nan"), float("nan"))
+    _, _, h, l, c, _ = ohlcv[-1]
+    p = (h + l + c) / 3
+    r1 = 2 * p - l
+    s1 = 2 * p - h
+    # Return nearest support/resistance proxy
+    return (s1, r1)
+
+
+# -----------------------------
+# Market data provider (MVP: simulated)
+# -----------------------------
+class MarketDataProvider:
+    def get_snapshot(self, symbol: str, lookback: int) -> MarketSnapshot:
+        raise NotImplementedError
+
+
+class SimulatedProvider(MarketDataProvider):
+    def __init__(self, seed: int = 42, start_price: float = 50000.0):
+        self.rng = random.Random(seed)
+        self.price = start_price
+        self.ts = int(time.time())
+
+    def _step(self) -> float:
+        # random walk with mild clustering
+        shock = self.rng.gauss(0, 1)
+        drift = 0.02 * self.rng.choice([-1, 1])
+        pct = (drift + 0.25 * shock) / 100.0
+        self.price = max(10.0, self.price * (1 + pct))
+        self.ts += 60
+        return self.price
+
+    def get_snapshot(self, symbol: str, lookback: int) -> MarketSnapshot:
+        # Generate OHLCV candles
+        ohlcv = []
+        p = self.price
+        ts = self.ts - lookback * 60
+        for _ in range(lookback):
+            o = p
+            c = self._step()
+            hi = max(o, c) * (1 + abs(self.rng.gauss(0, 0.0008)))
+            lo = min(o, c) * (1 - abs(self.rng.gauss(0, 0.0008)))
+            v = abs(self.rng.gauss(100, 30))
+            ts += 60
+            ohlcv.append((ts, o, hi, lo, c, v))
+            p = c
+        return MarketSnapshot(symbol=symbol, ts=self.ts, price=self.price, ohlcv=ohlcv)
+
+
+# -----------------------------
+# Agents (deterministic heuristics)
+# -----------------------------
+class Agent:
+    name: str
+
+    def decide(self, snap: MarketSnapshot) -> Verdict:
+        raise NotImplementedError
+
+
+class TrendAgent(Agent):
+    name = "TrendAgent"
+
+    def decide(self, snap: MarketSnapshot) -> Verdict:
+        closes = [c for (_, _, _, _, c, _) in snap.ohlcv]
+        fast = ema(closes[-60:], 9)
+        slow = ema(closes[-60:], 21)
+        a = atr(snap.ohlcv, 14) or 1.0
+        diff = (fast - slow) / a
+
+        if diff > 0.5:
+            conf = min(0.95, 0.5 + abs(diff) * 0.25)
+            return Verdict(self.name, Action.LONG, conf, f"EMA9>EMA21 by {diff:.2f} ATR")
+        if diff < -0.5:
+            conf = min(0.95, 0.5 + abs(diff) * 0.25)
+            return Verdict(self.name, Action.SHORT, conf, f"EMA9<EMA21 by {diff:.2f} ATR")
+        return Verdict(self.name, Action.HOLD, 0.60, f"No clear EMA separation (diff {diff:.2f})")
+
+
+class MeanReversionAgent(Agent):
+    name = "MeanReversionAgent"
+
+    def decide(self, snap: MarketSnapshot) -> Verdict:
+        closes = [c for (_, _, _, _, c, _) in snap.ohlcv]
+        lower, mid, upper = bollinger(closes, 20, 2.0)
+        price = closes[-1]
+        if price < lower:
+            z = (mid - price) / max(1e-9, (upper - mid))
+            conf = min(0.90, 0.55 + z * 0.25)
+            return Verdict(self.name, Action.LONG, conf, f"Below lower BB (z~{z:.2f})")
+        if price > upper:
+            z = (price - mid) / max(1e-9, (upper - mid))
+            conf = min(0.90, 0.55 + z * 0.25)
+            return Verdict(self.name, Action.SHORT, conf, f"Above upper BB (z~{z:.2f})")
+        return Verdict(self.name, Action.HOLD, 0.55, "Inside Bollinger band")
+
+
+class SupportResistanceAgent(Agent):
+    name = "SupportResistanceAgent"
+
+    def decide(self, snap: MarketSnapshot) -> Verdict:
+        price = snap.price
+        s1, r1 = pivot_levels(snap.ohlcv)
+        a = atr(snap.ohlcv, 14) or 1.0
+
+        if not (math.isfinite(s1) and math.isfinite(r1)):
+            return Verdict(self.name, Action.HOLD, 0.55, "No pivot levels")
+
+        dist_to_s = (price - s1) / a
+        dist_to_r = (r1 - price) / a
+
+        # Near support => long; near resistance => short
+        if 0 <= dist_to_s <= 0.8:
+            conf = min(0.88, 0.60 + (0.8 - dist_to_s) * 0.35)
+            return Verdict(self.name, Action.LONG, conf, f"Near support S1 ({dist_to_s:.2f} ATR away)")
+        if 0 <= dist_to_r <= 0.8:
+            conf = min(0.88, 0.60 + (0.8 - dist_to_r) * 0.35)
+            return Verdict(self.name, Action.SHORT, conf, f"Near resistance R1 ({dist_to_r:.2f} ATR away)")
+
+        return Verdict(self.name, Action.HOLD, 0.55, "Not near key S/R zone")
+
+
+class RiskAgent(Agent):
+    name = "RiskAgent"
+
+    def __init__(self, vol_lookback: int = 30):
+        self.vol_lookback = vol_lookback
+
+    def decide(self, snap: MarketSnapshot) -> Verdict:
+        closes = [c for (_, _, _, _, c, _) in snap.ohlcv]
+        v = realized_vol(closes[-self.vol_lookback :])
+        a = atr(snap.ohlcv, 14) or 1.0
+        # If volatility is high relative to ATR/price, vote HOLD with high confidence
+        vol_score = (v * math.sqrt(60))  # crude scale
+        if vol_score > 0.03:
+            conf = min(0.95, 0.75 + (vol_score - 0.03) * 5)
+            return Verdict(self.name, Action.HOLD, conf, f"High realized vol ({vol_score:.3f}) => reduce action")
+        # Otherwise, mild bias toward HOLD anyway
+        return Verdict(self.name, Action.HOLD, 0.70, f"Vol ok ({vol_score:.3f}); default inaction")
+
+
+class ContrarianAgent(Agent):
+    name = "ContrarianAgent"
+
+    def decide(self, snap: MarketSnapshot) -> Verdict:
+        # Purpose: inject decoherence; low weight will be applied in Judge
+        closes = [c for (_, _, _, _, c, _) in snap.ohlcv]
+        fast = ema(closes[-60:], 9)
+        slow = ema(closes[-60:], 21)
+        if fast > slow:
+            return Verdict(self.name, Action.SHORT, 0.55, "Contrarian vs trend (weak)")
+        if fast < slow:
+            return Verdict(self.name, Action.LONG, 0.55, "Contrarian vs trend (weak)")
+        return Verdict(self.name, Action.HOLD, 0.55, "No clear trend to oppose")
+
+
+# -----------------------------
+# Judge + Guardian
+# -----------------------------
+class JudgeAgent:
+    def __init__(self, min_agents_agree: int = 4):
+        self.min_agents_agree = min_agents_agree
+        # Weight contrarian low to avoid dominating
+        self.weights = {
+            "TrendAgent": 1.0,
+            "MeanReversionAgent": 1.0,
+            "SupportResistanceAgent": 1.0,
+            "RiskAgent": 1.0,
+            "ContrarianAgent": 0.35,
+        }
+
+    def aggregate(self, verdicts: List[Verdict]) -> Consensus:
+        notes: List[str] = []
+        total = len(verdicts)
+        if total == 0:
+            return Consensus(Action.HOLD, 0.0, 0, 0, 0.0, ["No agents"], [])
+
+        # vote tally
+        score = {Action.LONG: 0.0, Action.SHORT: 0.0, Action.HOLD: 0.0}
+        conf_sum = {Action.LONG: 0.0, Action.SHORT: 0.0, Action.HOLD: 0.0}
+        count = {Action.LONG: 0, Action.SHORT: 0, Action.HOLD: 0}
+
+        for v in verdicts:
+            w = self.weights.get(v.agent, 1.0)
+            score[v.action] += w * v.confidence
+            conf_sum[v.action] += v.confidence
+            count[v.action] += 1
+
+        # pick best non-hold if it beats hold by margin; else hold
+        best = max([Action.LONG, Action.SHORT], key=lambda a: score[a])
+        if score[best] <= score[Action.HOLD] + 0.10:
+            chosen = Action.HOLD
+        else:
+            chosen = best
+
+        agree = count[chosen]
+        agreement_ratio = agree / total
+
+        # enforce "min_agents_agree"
+        if chosen != Action.HOLD and agree < self.min_agents_agree:
+            notes.append(f"Veto: agree_count {agree} < min_agents_agree {self.min_agents_agree}")
+            chosen = Action.HOLD
+
+        # consensus confidence: avg confidence among agents that chose 'chosen', penalize disagreement
+        if count[chosen] > 0:
+            avg_conf = conf_sum[chosen] / count[chosen]
+        else:
+            avg_conf = 0.0
+
+        disagreement = 1.0 - agreement_ratio
+        cons_conf = max(0.0, min(1.0, avg_conf * (1.0 - 0.6 * disagreement)))
+
+        # groupthink warning: >90% agreement is a warning, not a boost
+        if agreement_ratio >= 0.90 and total >= 3:
+            notes.append("Warning: agreement >= 90% (possible groupthink) => cap confidence")
+            cons_conf = min(cons_conf, 0.80)
+
+        return Consensus(
+            action=chosen,
+            confidence=cons_conf,
+            agree_count=agree,
+            total_agents=total,
+            agreement_ratio=agreement_ratio,
+            notes=notes,
+            raw=verdicts,
+        )
+
+
+class PhilosophyGuardian:
+    def __init__(self, laws: IronLaws, fees: Fees, risk: RiskConfig):
+        self.laws = laws
+        self.fees = fees
+        self.risk = risk
+
+    def _estimate_cost(self, notional: float) -> float:
+        # entry + exit taker fees (rough)
+        return notional * (self.fees.taker_fee * 2)
+
+    def build_plan(self, cons: Consensus, snap: MarketSnapshot, portfolio: PortfolioState) -> Optional[TradePlan]:
+        if cons.action == Action.HOLD:
+            return None
+
+        price = snap.price
+        a = atr(snap.ohlcv, 14) or (price * 0.002)
+        # position sizing: base on volatility (inverse)
+        closes = [c for (_, _, _, _, c, _) in snap.ohlcv]
+        rv = realized_vol(closes[-self.risk.vol_lookback :]) or 0.0001
+        vol_scale = 1.0 / (1.0 + 50.0 * rv)  # crude shrink
+        base_pos = self.laws.MAX_POSITION * 0.8  # keep headroom
+        position_frac = max(0.01, min(self.laws.MAX_POSITION, base_pos * vol_scale))
+
+        leverage = max(1.0, min(self.laws.MAX_LEVERAGE, self.risk.initial_leverage))
+
+        # Stop/Take based on ATR and RR
+        sl_dist = 1.2 * a
+        tp_dist = self.risk.rr_target * sl_dist
+
+        if cons.action == Action.LONG:
+            stop = price - sl_dist
+            take = price + tp_dist
+        else:
+            stop = price + sl_dist
+            take = price - tp_dist
+
+        equity = portfolio.equity
+        notional = equity * position_frac * leverage
+        expected_cost = self._estimate_cost(notional)
+
+        # expected profit: tp distance * qty - cost
+        qty = notional / price
+        gross_profit = abs(take - price) * qty
+        expected_profit = gross_profit - expected_cost
+
+        return TradePlan(
+            action=cons.action,
+            symbol=snap.symbol,
+            leverage=leverage,
+            position_frac=position_frac,
+            entry=price,
+            stop=stop,
+            take=take,
+            stoploss_mode=self.laws.STOP_LOSS_MODE,
+            expected_profit=expected_profit,
+            expected_cost=expected_cost,
+        )
+
+    def evaluate(self, cons: Consensus, plan: TradePlan) -> Tuple[bool, List[str]]:
+        reasons: List[str] = []
+
+        # Iron Law: MIN_CONFIDENCE
+        if cons.confidence < self.laws.MIN_CONFIDENCE:
+            reasons.append(f"MIN_CONFIDENCE fail: {cons.confidence:.2f} < {self.laws.MIN_CONFIDENCE:.2f}")
+
+        # Iron Law: MAX_LEVERAGE
+        if plan.leverage > self.laws.MAX_LEVERAGE:
+            reasons.append(f"MAX_LEVERAGE fail: {plan.leverage:.2f} > {self.laws.MAX_LEVERAGE:.2f}")
+
+        # Iron Law: MAX_POSITION
+        if plan.position_frac > self.laws.MAX_POSITION:
+            reasons.append(f"MAX_POSITION fail: {plan.position_frac:.2f} > {self.laws.MAX_POSITION:.2f}")
+
+        # Iron Law: STOP_LOSS server-side required
+        if plan.stoploss_mode != "server":
+            reasons.append("STOP_LOSS_MODE fail: must be 'server'")
+
+        # Iron Law: MIN_PROFIT >= 3 * COST
+        if plan.expected_profit < self.laws.MIN_PROFIT_MULT * plan.expected_cost:
+            reasons.append(
+                f"MIN_PROFIT fail: profit {plan.expected_profit:.2f} < "
+                f"{self.laws.MIN_PROFIT_MULT:.1f} * cost {plan.expected_cost:.2f}"
+            )
+
+        ok = len(reasons) == 0
+        return ok, reasons
+
+
+# -----------------------------
+# Paper execution
+# -----------------------------
+class PaperBroker:
+    def __init__(self, fees: Fees):
+        self.fees = fees
+
+    def _fee(self, notional: float) -> float:
+        return notional * self.fees.taker_fee
+
+    def mark_to_market(self, portfolio: PortfolioState, snap: MarketSnapshot) -> None:
+        # Update equity based on open position
+        if portfolio.position is None:
+            portfolio.equity = portfolio.cash
+        else:
+            pos = portfolio.position
+            price = snap.price
+            notional = pos.qty * pos.entry * pos.leverage
+            pnl = (price - pos.entry) * pos.qty * pos.leverage
+            if pos.action == Action.SHORT:
+                pnl = (pos.entry - price) * pos.qty * pos.leverage
+            portfolio.equity = portfolio.cash + pnl
+
+        portfolio.high_watermark = max(portfolio.high_watermark, portfolio.equity)
+
+    def maybe_close(self, portfolio: PortfolioState, snap: MarketSnapshot) -> Optional[Dict]:
+        pos = portfolio.position
+        if pos is None:
+            return None
+
+        price = snap.price
+        hit_stop = (price <= pos.stop) if pos.action == Action.LONG else (price >= pos.stop)
+        hit_take = (price >= pos.take) if pos.action == Action.LONG else (price <= pos.take)
+
+        if not (hit_stop or hit_take):
+            return None
+
+        # Close at market price
+        notional = pos.qty * price * pos.leverage
+        fee = self._fee(notional)
+        if pos.action == Action.LONG:
+            pnl = (price - pos.entry) * pos.qty * pos.leverage
+        else:
+            pnl = (pos.entry - price) * pos.qty * pos.leverage
+
+        portfolio.cash = portfolio.cash + pnl - fee
+        portfolio.position = None
+
+        return {
+            "type": "CLOSE",
+            "reason": "STOP" if hit_stop else "TAKE",
+            "exit_price": price,
+            "pnl": pnl,
+            "fee": fee,
+            "equity": portfolio.cash,
+        }
+
+    def open(self, portfolio: PortfolioState, plan: TradePlan, ts: int) -> Dict:
+        # close existing first (MVP: single position)
+        if portfolio.position is not None:
+            raise RuntimeError("Position already open (MVP supports single position).")
+
+        equity = portfolio.equity
+        notional = equity * plan.position_frac * plan.leverage
+        qty = notional / plan.entry
+        fee = self._fee(notional)
+
+        # Deduct fee immediately
+        portfolio.cash -= fee
+
+        portfolio.position = Position(
+            action=plan.action,
+            entry=plan.entry,
+            qty=qty,
+            stop=plan.stop,
+            take=plan.take,
+            leverage=plan.leverage,
+            opened_ts=ts,
+        )
+        portfolio.last_trade_ts = ts
+        portfolio.trades_in_last_24h.append(ts)
+
+        return {
+            "type": "OPEN",
+            "action": plan.action.value,
+            "entry": plan.entry,
+            "qty": qty,
+            "stop": plan.stop,
+            "take": plan.take,
+            "leverage": plan.leverage,
+            "position_frac": plan.position_frac,
+            "fee": fee,
+        }
+
+
+# -----------------------------
+# Council engine
+# -----------------------------
+class CouncilEngine:
+    def __init__(
+        self,
+        provider: MarketDataProvider,
+        agents: List[Agent],
+        judge: JudgeAgent,
+        guardian: PhilosophyGuardian,
+        broker: PaperBroker,
+        laws: IronLaws,
+        risk: RiskConfig,
+        cfg: CouncilConfig,
+        log_path: str = "council_log.jsonl",
+    ):
+        self.provider = provider
+        self.agents = agents
+        self.judge = judge
+        self.guardian = guardian
+        self.broker = broker
+        self.laws = laws
+        self.risk = risk
+        self.cfg = cfg
+
+        self.log_path = log_path
+        self.obs_count = 0
+        self.action_count = 0
+        self.portfolio = PortfolioState()
+        self._load_state()
+
+    def _load_state(self) -> None:
+        state_file = "council_state.json"
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                self.portfolio = PortfolioState(**{k: d[k] for k in d if k in PortfolioState.__annotations__})
+                # position needs special handling
+                if d.get("position"):
+                    self.portfolio.position = Position(**d["position"])
+            except Exception:
+                # ignore and start fresh
+                pass
+
+    def _save_state(self) -> None:
+        d = dataclasses.asdict(self.portfolio)
+        # Position is already dict or None
+        with open("council_state.json", "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+
+    def _log(self, record: Dict) -> None:
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _cooling_ok(self, now_ts: int) -> Tuple[bool, str]:
+        if self.portfolio.last_trade_ts == 0:
+            return True, ""
+        dt = now_ts - self.portfolio.last_trade_ts
+        if dt < self.laws.COOLING_PERIOD_SEC:
+            return False, f"Cooling: {dt}s < {self.laws.COOLING_PERIOD_SEC}s"
+        return True, ""
+
+    def _daily_limit_ok(self, now_ts: int) -> Tuple[bool, str]:
+        cutoff = now_ts - 24 * 3600
+        self.portfolio.trades_in_last_24h = [t for t in self.portfolio.trades_in_last_24h if t >= cutoff]
+        if len(self.portfolio.trades_in_last_24h) >= self.laws.DAILY_TRADE_LIMIT:
+            return False, f"DailyTradeLimit hit: {len(self.portfolio.trades_in_last_24h)} >= {self.laws.DAILY_TRADE_LIMIT}"
+        return True, ""
+
+    def _drawdown_ok(self) -> Tuple[bool, str]:
+        if self.portfolio.high_watermark <= 0:
+            return True, ""
+        dd = (self.portfolio.high_watermark - self.portfolio.equity) / self.portfolio.high_watermark
+        if dd >= self.risk.max_drawdown_hard:
+            return False, f"Hard drawdown halt: {dd:.2%} >= {self.risk.max_drawdown_hard:.2%}"
+        return True, ""
+
+    def run_once(self) -> None:
+        snap = self.provider.get_snapshot(self.cfg.symbol, self.cfg.candle_lookback)
+        now_ts = snap.ts
+
+        # Mark-to-market & auto close
+        self.broker.mark_to_market(self.portfolio, snap)
+        close_event = self.broker.maybe_close(self.portfolio, snap)
+        if close_event:
+            self._log({"ts": now_ts, "symbol": snap.symbol, "event": close_event})
+            print(f"🧾 CLOSE {close_event['reason']} pnl={close_event['pnl']:.2f} equity={close_event['equity']:.2f}")
+
+        # Circuit breaker: drawdown hard halt
+        ok_dd, dd_reason = self._drawdown_ok()
+        if not ok_dd:
+            self.obs_count += 1
+            self._log({"ts": now_ts, "symbol": snap.symbol, "cycle": "HALT", "reason": dd_reason, "equity": self.portfolio.equity})
+            print(f"🛑 HALT: {dd_reason}")
+            self._save_state()
+            return
+
+        self.obs_count += 1
+
+        # 1) Agents decide
+        verdicts = [a.decide(snap) for a in self.agents]
+
+        # 2) Judge consensus/debate (MVP: aggregation only)
+        cons = self.judge.aggregate(verdicts)
+
+        # 3) If HOLD, log and exit
+        if cons.action == Action.HOLD:
+            self._log({
+                "ts": now_ts,
+                "symbol": snap.symbol,
+                "cycle": "HOLD",
+                "price": snap.price,
+                "consensus": dataclasses.asdict(cons),
+                "equity": self.portfolio.equity,
+                "action_rate": self.action_count / max(1, self.obs_count),
+            })
+            print(f"⏸️ HOLD | conf={cons.confidence:.2f} | agree={cons.agree_count}/{cons.total_agents} | equity={self.portfolio.equity:.2f}")
+            for n in cons.notes:
+                print("  -", n)
+            self._save_state()
+            return
+
+        # 4) Cooling + Daily limit
+        ok_cool, cool_reason = self._cooling_ok(now_ts)
+        if not ok_cool:
+            self._log({"ts": now_ts, "symbol": snap.symbol, "cycle": "VETO", "reason": cool_reason, "consensus": dataclasses.asdict(cons)})
+            print(f"🧊 VETO: {cool_reason}")
+            self._save_state()
+            return
+
+        ok_day, day_reason = self._daily_limit_ok(now_ts)
+        if not ok_day:
+            self._log({"ts": now_ts, "symbol": snap.symbol, "cycle": "VETO", "reason": day_reason, "consensus": dataclasses.asdict(cons)})
+            print(f"📆 VETO: {day_reason}")
+            self._save_state()
+            return
+
+        # 5) Build trade plan + PhilosophyGuardian (Five Iron Laws)
+        plan = self.guardian.build_plan(cons, snap, self.portfolio)
+        if plan is None:
+            self._log({"ts": now_ts, "symbol": snap.symbol, "cycle": "HOLD", "reason": "No plan"})
+            print("⏸️ HOLD (no plan)")
+            self._save_state()
+            return
+
+        ok, reasons = self.guardian.evaluate(cons, plan)
+        if not ok:
+            self._log({
+                "ts": now_ts,
+                "symbol": snap.symbol,
+                "cycle": "VETO",
+                "price": snap.price,
+                "reasons": reasons,
+                "plan": dataclasses.asdict(plan),
+                "consensus": dataclasses.asdict(cons),
+                "equity": self.portfolio.equity,
+            })
+            print(f"🛡️ VETO by Guardian: {', '.join(reasons)}")
+            self._save_state()
+            return
+
+        # 6) Execute trade (paper)
+        self.action_count += 1
+        open_event = self.broker.open(self.portfolio, plan, now_ts)
+
+        self._log({
+            "ts": now_ts,
+            "symbol": snap.symbol,
+            "cycle": "TRADE",
+            "price": snap.price,
+            "open": open_event,
+            "plan": dataclasses.asdict(plan),
+            "consensus": dataclasses.asdict(cons),
+            "equity": self.portfolio.equity,
+            "action_rate": self.action_count / max(1, self.obs_count),
+        })
+
+        print(
+            f"✅ TRADE {open_event['action']} entry={open_event['entry']:.2f} "
+            f"SL={open_event['stop']:.2f} TP={open_event['take']:.2f} "
+            f"pos={open_event['position_frac']:.2%} lev={open_event['leverage']:.1f} "
+            f"| conf={cons.confidence:.2f} | actionRate={self.action_count / max(1, self.obs_count):.2%}"
+        )
+        for n in cons.notes:
+            print("  -", n)
+
+        self._save_state()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--symbol", default="BTC/USDT")
+    ap.add_argument("--interval", type=int, default=60, help="seconds between cycles")
+    ap.add_argument("--start-equity", type=float, default=1000.0)
+    ap.add_argument("--log", default="council_log.jsonl")
+    args = ap.parse_args()
+
+    cfg = CouncilConfig(symbol=args.symbol, timeframe_sec=args.interval)
+    random.seed(cfg.seed)
+
+    laws = IronLaws()
+    fees = Fees()
+    risk = RiskConfig(initial_leverage=1.0)  # MVP default: no leverage
+
+    provider = SimulatedProvider(seed=cfg.seed, start_price=50000.0)
+
+    agents: List[Agent] = [
+        TrendAgent(),
+        MeanReversionAgent(),
+        SupportResistanceAgent(),
+        RiskAgent(vol_lookback=risk.vol_lookback),
+        ContrarianAgent(),
+    ]
+
+    judge = JudgeAgent(min_agents_agree=cfg.min_agents_agree)
+    guardian = PhilosophyGuardian(laws=laws, fees=fees, risk=risk)
+    broker = PaperBroker(fees=fees)
+
+    engine = CouncilEngine(
+        provider=provider,
+        agents=agents,
+        judge=judge,
+        guardian=guardian,
+        broker=broker,
+        laws=laws,
+        risk=risk,
+        cfg=cfg,
+        log_path=args.log,
+    )
+    engine.portfolio.cash = args.start_equity
+    engine.portfolio.equity = args.start_equity
+    engine.portfolio.high_watermark = args.start_equity
+
+    print("🧠 Council MVP started (paper mode). Ctrl+C to stop.")
+    print(f"Symbol={cfg.symbol} Interval={cfg.timeframe_sec}s  MIN_CONF={laws.MIN_CONFIDENCE}  MIN_AGREE={cfg.min_agents_agree}/5")
+
+    try:
+        while True:
+            engine.run_once()
+            time.sleep(cfg.timeframe_sec)
+    except KeyboardInterrupt:
+        print("\n👋 stopped.")
+
+
+if __name__ == "__main__":
+    main()
