@@ -504,6 +504,12 @@ class FundingAgentTests(unittest.TestCase):
 
 
 class TestRemovedAgents(unittest.TestCase):
+    def test_council_engine_does_not_use_signal_memory(self):
+        self.assertFalse(
+            hasattr(council_v2, "SignalMemory"),
+            "SignalMemory must be removed — smoothing chart noise amplifies false signal, not real pressure",
+        )
+
     def test_engine_does_not_register_meanreversion_agent(self):
         self.assertFalse(
             hasattr(council_v2, "MeanReversionAgent"),

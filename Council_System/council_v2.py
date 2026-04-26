@@ -924,35 +924,6 @@ class FundingFlowAgent(Agent):
 # =========================
 # Signal Memory (water momentum)
 # =========================
-class SignalMemory:
-    """Exponentially-decayed signal accumulator — water's inertia.
-
-    pressure = α * current_signal + (1-α) * previous_pressure
-
-    Prevents the system from losing context between candles.
-    A consistent signal across 3-4 rounds accumulates enough
-    pressure to boost confidence past the threshold.
-    """
-
-    def __init__(self, decay: float = 0.4):
-        self.decay = decay
-        self.pressure: float = 0.0  # -1.0 (strong short) to +1.0 (strong long)
-
-    def update(self, signal: float) -> float:
-        """Update with directional signal. Returns new pressure."""
-        self.pressure = self.decay * signal + (1 - self.decay) * self.pressure
-        return self.pressure
-
-    def idle_decay(self) -> None:
-        """Call on HOLD rounds. Pressure decays toward 0."""
-        self.pressure *= (1 - self.decay * 0.3)
-
-    def to_dict(self) -> Dict:
-        return {"pressure": self.pressure}
-
-    def from_dict(self, d: Dict) -> None:
-        self.pressure = d.get("pressure", 0.0)
-
 
 # =========================
 # Judge + Guardian (pre-trade)
@@ -1395,9 +1366,6 @@ class CouncilEngine:
         self.edge_tracker = EdgeDecayTracker()
         self._last_voting_agents: List[str] = []  # agents who voted for the current position
 
-        # Water momentum: signal memory carries pressure between rounds
-        self.signal_memory = SignalMemory(decay=0.4)
-
         self.obs_count = 0
         self.action_count = 0
         self.portfolio = PortfolioState()
@@ -1424,9 +1392,6 @@ class CouncilEngine:
             self.portfolio = PortfolioState(**{k: d[k] for k in d if k in PortfolioState.__annotations__})
             if d.get("position"):
                 self.portfolio.position = Position(**d["position"])
-            # Restore signal memory (water momentum)
-            if d.get("signal_memory"):
-                self.signal_memory.from_dict(d["signal_memory"])
             # Restore edge attribution for open positions
             if d.get("_last_voting_agents"):
                 self._last_voting_agents = d["_last_voting_agents"]
@@ -1435,7 +1400,6 @@ class CouncilEngine:
 
     def _save_state(self) -> None:
         d = dataclasses.asdict(self.portfolio)
-        d["signal_memory"] = self.signal_memory.to_dict()
         d["_last_voting_agents"] = self._last_voting_agents
         with open(self._state_file(), "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=2)
@@ -1582,32 +1546,7 @@ class CouncilEngine:
                 notes=cons.notes + [f"Intel watch cap applied: conf→{intel_watch_cap} (was {cons.confidence:.2f})"],
             )
 
-        # Water momentum: accumulate signal pressure across rounds
-        if cons.action == Action.LONG:
-            raw_signal = cons.confidence
-        elif cons.action == Action.SHORT:
-            raw_signal = -cons.confidence
-        else:
-            raw_signal = 0.0
-
-        pressure = self.signal_memory.update(raw_signal) if raw_signal != 0.0 else 0.0
-        if raw_signal == 0.0:
-            self.signal_memory.idle_decay()
-            pressure = self.signal_memory.pressure
-
-        # Momentum boost: if pressure aligns with consensus direction
-        if cons.action != Action.HOLD:
-            aligned = (cons.action == Action.LONG and pressure > 0.25) or \
-                      (cons.action == Action.SHORT and pressure < -0.25)
-            if aligned:
-                boost = min(0.10, abs(pressure) * 0.15)
-                cons = dataclasses.replace(
-                    cons,
-                    confidence=min(0.95, cons.confidence + boost),
-                    notes=cons.notes + [f"Momentum boost: pressure={pressure:.3f} → +{boost:.3f}"],
-                )
-
-        # Re-apply watch cap AFTER momentum boost — watch is a hard ceiling, not a suggestion
+        # Re-apply watch cap if needed — watch is a hard ceiling, not a suggestion
         if intel_watch_cap is not None and cons.confidence > intel_watch_cap:
             cons = dataclasses.replace(
                 cons,
@@ -1625,9 +1564,8 @@ class CouncilEngine:
                 "intel_policy": intel_policy_dict,
                 "equity": self.portfolio.equity,
                 "action_rate": self.action_count / max(1, self.obs_count),
-                "signal_pressure": pressure,
             })
-            print(f"⏸️ HOLD | level={level} conf={cons.confidence:.2f} agree={cons.agree_count}/{cons.total_agents} pressure={pressure:+.3f} equity={self.portfolio.equity:.2f}")
+            print(f"⏸️ HOLD | level={level} conf={cons.confidence:.2f} agree={cons.agree_count}/{cons.total_agents} equity={self.portfolio.equity:.2f}")
             self._save_state()
             return
 
