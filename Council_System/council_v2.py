@@ -753,24 +753,6 @@ class TrendAgent(Agent):
         return Verdict(self.name, Action.HOLD, 0.60, f"No clear EMA separation (diff {diff:.2f})")
 
 
-class MeanReversionAgent(Agent):
-    name = "MeanReversionAgent"
-    def decide(self, snap: MarketSnapshot) -> Verdict:
-        closes = [c for (_, _, _, _, c, _) in snap.ohlcv]
-        lower, mid, upper = bollinger(closes, 20, 1.5)  # 1.5σ: triggers more often than 2.0
-        price = closes[-1]
-        if price < lower:
-            z = (mid - price) / max(1e-9, (upper - mid))
-            conf = min(0.90, 0.55 + z * 0.25)
-            return Verdict(self.name, Action.LONG, conf, f"Below lower BB (z~{z:.2f})",
-                           counterparty_thesis="Panic sellers and liquidated longs at extreme deviation from mean")
-        if price > upper:
-            z = (price - mid) / max(1e-9, (upper - mid))
-            conf = min(0.90, 0.55 + z * 0.25)
-            return Verdict(self.name, Action.SHORT, conf, f"Above upper BB (z~{z:.2f})",
-                           counterparty_thesis="FOMO buyers and momentum chasers at unsustainable extension")
-        return Verdict(self.name, Action.HOLD, 0.55, "Inside Bollinger band")
-
 
 class SupportResistanceAgent(Agent):
     name = "SupportResistanceAgent"
@@ -980,7 +962,6 @@ class JudgeAgent:
         self.min_agents_agree = min_agents_agree
         self.weights = {
             "TrendAgent": 1.0,
-            "MeanReversionAgent": 1.0,
             "SupportResistanceAgent": 1.0,
             "RiskAgent": 0.5,
             "LiquidationPressureAgent": 1.2,  # highest weight: microstructure > chart patterns
@@ -1825,7 +1806,6 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     agents: List[Agent] = [
         TrendAgent(),
-        MeanReversionAgent(),
         SupportResistanceAgent(),
         RiskAgent(vol_lookback=risk.vol_lookback),
         LiquidationPressureAgent(intel_bridge=intel_bridge),

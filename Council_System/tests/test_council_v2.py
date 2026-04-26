@@ -71,7 +71,7 @@ class CouncilFragilityAuditTests(unittest.TestCase):
         judge = council_v2.JudgeAgent(min_agents_agree=4)
         verdicts = [
             council_v2.Verdict("TrendAgent", council_v2.Action.LONG, 0.90, "trend_strong_up"),
-            council_v2.Verdict("MeanReversionAgent", council_v2.Action.SHORT, 0.85, "bollinger_overbought"),
+            council_v2.Verdict("FundingFlowAgent", council_v2.Action.SHORT, 0.85, "funding_negative_extreme"),
             council_v2.Verdict("SupportResistanceAgent", council_v2.Action.LONG, 0.60, "support_held"),
             council_v2.Verdict("RiskAgent", council_v2.Action.HOLD, 0.50, "neutral_risk"),
         ]
@@ -84,7 +84,7 @@ class CouncilFragilityAuditTests(unittest.TestCase):
     def test_risk_agent_high_confidence_hold_raises_effective_min_confidence(self):
         verdicts = [
             council_v2.Verdict("TrendAgent", council_v2.Action.LONG, 0.90, "trend_up"),
-            council_v2.Verdict("MeanReversionAgent", council_v2.Action.LONG, 0.80, "mean_revert_long"),
+            council_v2.Verdict("FundingFlowAgent", council_v2.Action.LONG, 0.80, "funding_positive_turning"),
             council_v2.Verdict("SupportResistanceAgent", council_v2.Action.LONG, 0.85, "support_bounce"),
             council_v2.Verdict("RiskAgent", council_v2.Action.HOLD, 0.95, "volatility_too_high"),
         ]
@@ -291,7 +291,7 @@ class IntelBridgeTests(unittest.TestCase):
         cfg = council_v2.CouncilConfig(symbol="BTC/USDT", candle_lookback=60)
 
         agents = [
-            council_v2.TrendAgent(), council_v2.MeanReversionAgent(),
+            council_v2.TrendAgent(),
             council_v2.SupportResistanceAgent(), council_v2.RiskAgent(),
         ]
         bridge = council_v2.IntelBridge(intel_dir=tmp_dir, staleness_sec=999999)
@@ -448,7 +448,7 @@ class IntelBridgeTests(unittest.TestCase):
             provider = SequenceProvider([self._snapshot(1000, 50000.0)])
             agents = [
                 StaticVerdictAgent("TrendAgent", council_v2.Action.LONG),
-                StaticVerdictAgent("MeanReversionAgent", council_v2.Action.LONG),
+                StaticVerdictAgent("FundingFlowAgent", council_v2.Action.LONG),
                 StaticVerdictAgent("SupportResistanceAgent", council_v2.Action.LONG),
             ]
 
@@ -503,7 +503,13 @@ class FundingAgentTests(unittest.TestCase):
         self.assertIn("OI=unknown", verdict.counterparty_thesis)
 
 
-class TestContrarianAgentRemoved(unittest.TestCase):
+class TestRemovedAgents(unittest.TestCase):
+    def test_engine_does_not_register_meanreversion_agent(self):
+        self.assertFalse(
+            hasattr(council_v2, "MeanReversionAgent"),
+            "MeanReversionAgent must be removed — Bollinger-band thesis is chart-derived with templated counterparty copy",
+        )
+
     def test_engine_does_not_register_contrarian_agent(self):
         self.assertFalse(
             hasattr(council_v2, "ContrarianAgent"),
