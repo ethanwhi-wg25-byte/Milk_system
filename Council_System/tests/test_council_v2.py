@@ -523,6 +523,19 @@ class TestRemovedAgents(unittest.TestCase):
         )
 
 
+class TestRemovedHelpers(unittest.TestCase):
+    """is_funding_turning was a sign-flip heuristic — funding flipping does not
+    by itself mean someone is forced. forced_flow primitives (z-score extreme,
+    flip + 1σ magnitude) replace it. Remove the helper and its policy rule."""
+
+    def test_council_intel_does_not_export_is_funding_turning(self):
+        import council_intel
+        self.assertFalse(
+            hasattr(council_intel, "is_funding_turning"),
+            "is_funding_turning must be removed — sign-flip alone is not forced flow",
+        )
+
+
 class IronLawsStrictDefaultsTests(unittest.TestCase):
     """After cutting weak agents, the law floor must return to production strict."""
 

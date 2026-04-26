@@ -83,10 +83,6 @@ def has_meaningful_funding_signal(data: Optional[Dict[str, Any]]) -> bool:
     return bool(data and data.get("is_anomalous"))
 
 
-def is_funding_turning(data: Optional[Dict[str, Any]]) -> bool:
-    return bool(data and data.get("is_turning"))
-
-
 class StaticCoinGeckoProvider:
     def __init__(self, top_assets: Optional[List[Dict]] = None, asset_snapshots: Optional[Dict[str, Dict]] = None):
         self.top_assets = top_assets or []
@@ -504,7 +500,6 @@ def evaluate_asset_policy(
     has_market_data = bool(market_data)
     has_market_move = "market-move" in tags
     has_funding_signal = has_meaningful_funding_signal(funding_data)
-    has_funding_turning = is_funding_turning(funding_data)
 
     evidence: List[str] = []
     if has_market_data:
@@ -518,17 +513,15 @@ def evaluate_asset_policy(
     crowding_risk = "moderate"
     rationale = ["default_refusal"]
 
+    # investigate is reserved for forced-flow primitives (funding extreme,
+    # OI divergence, liquidation cascade). Funding signal alone → watch only.
     if has_market_move and len(evidence) == 1:
         crowding_risk = "high"
         rationale = ["public_market_move_only"]
-    elif has_watchlist and has_funding_turning:
-        recommended_action = "investigate"
-        crowding_risk = "low"
-        rationale = ["orthogonal_watchlist_confirmation"]
     elif has_watchlist and has_funding_signal:
         recommended_action = "watch"
-        crowding_risk = "moderate"
-        rationale = ["funding_signal_watch"]
+        crowding_risk = "low"
+        rationale = ["watchlist_funding_signal_watch"]
     elif has_market_move and len(evidence) <= 2:
         recommended_action = "watch"
         crowding_risk = "elevated"
@@ -564,8 +557,6 @@ def build_asset_card(
                 tags.append("market-move")
     if has_meaningful_funding_signal(funding_data):
         tags.append("funding-signal")
-    if is_funding_turning(funding_data):
-        tags.append("funding-turning")
 
     providers = {
         "coingecko": {
@@ -598,7 +589,6 @@ def card_priority(card: Dict) -> tuple:
     tags = set(card.get("tags", []))
     return (
         1 if "watchlist" in tags else 0,
-        1 if "funding-turning" in tags else 0,
         1 if "funding-signal" in tags else 0,
         1 if "market-move" in tags else 0,
         card.get("symbol", ""),
@@ -653,15 +643,6 @@ def build_markdown_report(report: Dict) -> str:
     funding_signal_assets = report["summary"].get("funding_signal_assets", [])
     if funding_signal_assets:
         for symbol in funding_signal_assets:
-            lines.append(f"- {symbol}")
-    else:
-        lines.append("- None")
-
-    lines.extend(["", "## Funding Turning Assets"])
-
-    funding_turning_assets = report["summary"].get("funding_turning_assets", [])
-    if funding_turning_assets:
-        for symbol in funding_turning_assets:
             lines.append(f"- {symbol}")
     else:
         lines.append("- None")
@@ -758,7 +739,6 @@ def run_intel_cycle(config: Dict, out_dir: Path, provider_bundle: Optional[Provi
     assets.sort(key=card_priority, reverse=True)
     highest_interest = [asset["symbol"] for asset in assets[: min(5, len(assets))]]
     funding_signal_assets = [asset["symbol"] for asset in assets if "funding-signal" in asset.get("tags", [])]
-    funding_turning_assets = [asset["symbol"] for asset in assets if "funding-turning" in asset.get("tags", [])]
     investigate_candidates = [
         asset["symbol"]
         for asset in assets
@@ -795,7 +775,6 @@ def run_intel_cycle(config: Dict, out_dir: Path, provider_bundle: Optional[Provi
             "no_trade_assets": no_trade_assets,
             "crowding_warnings": crowding_warnings,
             "funding_signal_assets": funding_signal_assets,
-            "funding_turning_assets": funding_turning_assets,
         },
     }
     report["universe"]["unresolved"] = unresolved
