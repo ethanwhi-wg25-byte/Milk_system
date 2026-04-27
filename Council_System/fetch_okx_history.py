@@ -86,19 +86,14 @@ def fetch_funding_history(inst_id: str, days: int) -> List[Tuple[int, float]]:
     return [(ts, r) for ts, r in sorted(seen.items())]
 
 
-def _fetch_rubik_paginated(
-    path: str,
-    inst_id: str,
-    period: str,
-    days: int,
-) -> List[List]:
-    """Fetch a rubik stat endpoint that returns [ts, val, ...] rows, paginated."""
+def _fetch_rubik_ccy_paginated(path: str, ccy: str, period: str, days: int) -> List[List]:
+    """Fetch a rubik stat endpoint using ccy= param, paginated via end= timestamp."""
     since_ms = int((time.time() - days * 86400) * 1000)
     results: List[List] = []
     end: Optional[str] = None
 
     while True:
-        params: Dict[str, Any] = {"instId": inst_id, "period": period, "limit": 100}
+        params: Dict[str, Any] = {"ccy": ccy, "period": period}
         if end:
             params["end"] = end
         data = _fetch(path, params)
@@ -117,66 +112,70 @@ def _fetch_rubik_paginated(
         end = str(oldest_ts)
 
     results.sort(key=lambda r: int(r[0]))
-    # de-dup by ts
     seen: Dict[int, List] = {}
     for row in results:
         seen[int(row[0])] = row
     return [v for _, v in sorted(seen.items())]
 
 
-def fetch_ls_ratio(inst_id: str, days: int) -> List[Tuple[int, float, float]]:
-    """Returns (ts_ms, ls_account_ratio, ls_contract_ratio) tuples."""
-    acct_rows = _fetch_rubik_paginated(
-        "/api/v5/rubik/stat/contracts/long-short-account-ratio",
-        inst_id, "1H", days,
-    )
-    cont_rows = _fetch_rubik_paginated(
-        "/api/v5/rubik/stat/contracts/long-short-ratio",
-        inst_id, "1H", days,
-    )
-    # Index contract rows by ts for fast lookup
-    cont_by_ts: Dict[int, float] = {}
-    for row in cont_rows:
-        try:
-            cont_by_ts[int(row[0])] = float(row[1])
-        except (IndexError, TypeError, ValueError):
-            pass
+def _inst_to_ccy(inst_id: str) -> str:
+    """BTC-USDT-SWAP → BTC"""
+    return inst_id.split("-")[0]
 
+
+def fetch_ls_ratio(inst_id: str, days: int) -> List[Tuple[int, float, float]]:
+    """Returns (ts_ms, ls_account_ratio, ls_contract_ratio) tuples.
+
+    OKX rubik long-short-account-ratio uses ccy= param and returns [ts, ratio].
+    No separate contract ratio endpoint is publicly available; acct ratio used for both.
+    """
+    ccy = _inst_to_ccy(inst_id)
+    acct_rows = _fetch_rubik_ccy_paginated(
+        "/api/v5/rubik/stat/contracts/long-short-account-ratio",
+        ccy, "1H", days,
+    )
     results: List[Tuple[int, float, float]] = []
     for row in acct_rows:
         try:
             ts = int(row[0])
             acct = float(row[1])
-            cont = cont_by_ts.get(ts, acct)  # fallback: use acct ratio
-            results.append((ts, acct, cont))
+            results.append((ts, acct, -1.0))  # -1.0 sentinel = contract ratio unavailable
         except (IndexError, TypeError, ValueError):
             pass
     return results
 
 
 def fetch_taker_flow(inst_id: str, days: int) -> List[Tuple[int, float, float]]:
-    """Returns (ts_ms, buy_vol, sell_vol) tuples."""
-    rows = _fetch_rubik_paginated(
-        "/api/v5/rubik/stat/contracts/taker-volume",
-        inst_id, "1H", days,
+    """Returns (ts_ms, buy_vol, sell_vol) from open-interest-volume col[1] and col[2].
+
+    OKX open-interest-volume returns [ts, oi_usd, volume_usd].
+    We use volume as a taker-flow proxy: col[2] (24h trade volume) for both sides.
+    buy/sell split is estimated at 50/50 — real taker-volume endpoint is unavailable
+    for historical data without authentication. This gives taker_buy_ratio=0.5 by default,
+    which is conservative (no forced-flow signal unless LS ratio triggers).
+    """
+    ccy = _inst_to_ccy(inst_id)
+    rows = _fetch_rubik_ccy_paginated(
+        "/api/v5/rubik/stat/contracts/open-interest-volume",
+        ccy, "1H", days,
     )
     results: List[Tuple[int, float, float]] = []
     for row in rows:
         try:
             ts = int(row[0])
-            buy = float(row[1])
-            sell = float(row[2])
-            results.append((ts, buy, sell))
+            vol = float(row[2]) if len(row) > 2 else 0.0
+            results.append((ts, vol / 2, vol / 2))  # 50/50 split placeholder
         except (IndexError, TypeError, ValueError):
             pass
     return results
 
 
 def fetch_oi_snapshots(inst_id: str, days: int) -> List[Tuple[int, float]]:
-    """Returns (ts_ms, oi_contracts) tuples. Uses open-interest-volume rubik endpoint."""
-    rows = _fetch_rubik_paginated(
+    """Returns (ts_ms, oi_usd) from open-interest-volume col[1]."""
+    ccy = _inst_to_ccy(inst_id)
+    rows = _fetch_rubik_ccy_paginated(
         "/api/v5/rubik/stat/contracts/open-interest-volume",
-        inst_id, "1H", days,
+        ccy, "1H", days,
     )
     results: List[Tuple[int, float]] = []
     for row in rows:

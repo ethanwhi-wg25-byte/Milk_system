@@ -280,8 +280,12 @@ class HistoricalOKXBridge:
     OI_DELTA_WINDOW_H = 24 # hours back for oi_delta_pct computation
 
     def __init__(self, history_dir: str, symbol: str) -> None:
-        base = symbol.replace("/", "_")
-        d = Path(history_dir) / base
+        # Fetcher stores under bare base currency (BTC), not BTC_USDT.
+        base_ccy = symbol.split("/")[0].upper()
+        d = Path(history_dir) / base_ccy
+        if not d.exists():
+            # fallback: try slash-replaced form
+            d = Path(history_dir) / symbol.replace("/", "_")
 
         self._funding: List[Dict] = self._load(d / "funding_rates.json")
         self._ls:      List[Dict] = self._load(d / "ls_ratio.json")
@@ -386,7 +390,9 @@ class HistoricalOKXBridge:
                 rate_24h_ago is not None and rate * rate_24h_ago < 0
             ),
             "ls_ratio_account":  ls_row["acct"] if ls_row else None,
-            "ls_ratio_contract": ls_row["cont"] if ls_row else None,
+            # OKX rubik ccy= endpoint only gives account ratio, not contract/professional ratio.
+            # Always None so LiquidationPressureAgent uses account ratio alone.
+            "ls_ratio_contract": None,
             "taker_buy_ratio": taker_buy_ratio,
             "oi_value":        oi_row["oi"] if oi_row else 0.0,
             "oi_delta_pct_24h": self._oi_delta(ts_ms),
@@ -402,6 +408,10 @@ class HistoricalOKXBridge:
             "is_anomalous": data["is_anomalous"],
             "is_turning": data["is_turning"],
         }
+
+    def get_signal(self, symbol: str) -> None:
+        """No historical intel policy in shadow mode — agents use microstructure directly."""
+        return None
 
     def get_deribit_data(self, symbol: str) -> Optional[Dict]:
         # No free historical Deribit data — RiskAgent/OptionsGammaAgent skip gracefully
