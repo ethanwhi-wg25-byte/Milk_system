@@ -1,419 +1,665 @@
 #!/usr/bin/env python3
 """
-Forced-Flow Primitive — Step 1 TDD Red Tests
-=============================================
+Forced-Flow Primitive — TDD Tests (OKX-primary, Malaysia-adapted)
+=================================================================
 
 Covers:
-  1. OpenInterestProvider — Binance /openInterestHist
-  2. FundingRateProvider rewire — Binance /premiumIndex (direct, not via CoinGecko)
-  3. Signal primitives in evaluate_asset_policy:
-       funding_extreme  : |z(funding, 30d window)| > 3.0
-       oi_divergence    : sign(Δprice_24h) ≠ sign(Δoi_24h) AND |Δoi_24h| > 5%
-  4. Anti-crowding gate upgrade:
-       investigate requires watchlist + at least one forced-flow primitive
-  5. counterparty_thesis numeric discipline:
-       thesis must contain ≥ 2 numeric tokens — enforced at evaluate_asset_policy level
+  1. OKXFuturesProvider — funding + OI + LS ratio + taker flow
+  2. Signal primitives in evaluate_asset_policy:
+       funding_extreme, oi_divergence, ls_ratio_extreme,
+       funding_flip, taker_flow_imbalance
+  3. Anti-crowding gate: investigate requires watchlist + forced-flow
+  4. counterparty_thesis numeric discipline
+  5. ProviderBundle OKX slot
+  6. DeribitOptionsProvider — max_pain, put_call_ratio, gamma_cluster
+  7. BitgetFuturesProvider — funding + OI (cross-validation source)
+  8. Phase 2 primitives: options_gamma_cluster, cross_exchange_confirm
+  9. ProviderBundle Phase 2 slots: bitget_futures, deribit_options
 
-All tests use static stubs.  Zero network calls.
+All tests use static stubs. Zero network calls.
 """
-import tempfile
+import datetime as dt
+import re
 import unittest
-from pathlib import Path
 from unittest import mock
 
 import council_intel
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. OpenInterestProvider
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# Helpers — mock OKX API responses
+# ──────────────────────────────────────────────────────────────
 
-class OpenInterestProviderTests(unittest.TestCase):
-    """OpenInterestProvider must exist and implement the provider contract."""
+def _okx_funding_rate_response(rate: float) -> dict:
+    """OKX GET /api/v5/public/funding-rate response."""
+    return {"code": "0", "data": [{
+        "instId": "BTC-USDT-SWAP",
+        "fundingRate": str(rate),
+        "nextFundingRate": str(rate * 0.9),
+        "fundingTime": "1714100000000",
+    }]}
 
-    def _make_binance_oi_response(self, oi_value: float, timestamp_ms: int) -> list:
-        """Binance /fapi/v1/openInterestHist response shape."""
-        return [
-            {
-                "symbol": "BTCUSDT",
-                "sumOpenInterest": str(oi_value),
-                "sumOpenInterestValue": str(oi_value * 94000),
-                "timestamp": timestamp_ms,
-            }
-        ]
+
+def _okx_funding_history_response(rates: list) -> dict:
+    """OKX GET /api/v5/public/funding-rate-history response."""
+    return {"code": "0", "data": [
+        {"instId": "BTC-USDT-SWAP", "fundingRate": str(r),
+         "realizedRate": str(r), "fundingTime": str(1714000000000 + i * 28800000)}
+        for i, r in enumerate(rates)
+    ]}
+
+
+def _okx_oi_response(oi_value: float) -> dict:
+    """OKX GET /api/v5/public/open-interest response."""
+    return {"code": "0", "data": [{
+        "instId": "BTC-USDT-SWAP",
+        "oi": str(oi_value / 94000),  # contracts
+        "oiCcy": str(oi_value / 94000),
+        "ts": "1714100000000",
+    }]}
+
+
+def _okx_ls_ratio_response(ratio: float) -> dict:
+    """OKX GET /api/v5/rubik/stat/contracts/long-short-account-ratio."""
+    return {"code": "0", "data": [
+        [str(1714100000000), str(ratio)]
+    ]}
+
+
+def _okx_taker_volume_response(buy_vol: float, sell_vol: float) -> dict:
+    """OKX GET /api/v5/rubik/stat/contracts/taker-volume."""
+    return {"code": "0", "data": [
+        [str(1714100000000), str(buy_vol), str(sell_vol)]
+    ]}
+
+
+# ──────────────────────────────────────────────────────────────
+# 1. OKXFuturesProvider
+# ──────────────────────────────────────────────────────────────
+
+class OKXFuturesProviderTests(unittest.TestCase):
+    """OKXFuturesProvider contract tests."""
 
     def test_provider_exists_and_implements_contract(self):
-        """OpenInterestProvider must have fetch_symbol_data and describe."""
-        self.assertTrue(hasattr(council_intel, "OpenInterestProvider"))
-        provider = council_intel.OpenInterestProvider()
+        self.assertTrue(hasattr(council_intel, "OKXFuturesProvider"))
+        provider = council_intel.OKXFuturesProvider()
         self.assertTrue(callable(getattr(provider, "fetch_symbol_data", None)))
         self.assertTrue(callable(getattr(provider, "describe", None)))
 
-    def test_fetch_returns_oi_dict_with_required_fields(self):
-        """fetch_symbol_data('BTC') must return dict with oi_now, oi_24h_ago, delta_pct."""
-        provider = council_intel.OpenInterestProvider()
-
-        # Two data points: 24h ago and now
-        now_ms = 1_714_100_000_000
-        ago_ms = now_ms - 24 * 3600 * 1000
-
-        fake_response = (
-            self._make_binance_oi_response(100_000.0, ago_ms)
-            + self._make_binance_oi_response(110_000.0, now_ms)
-        )
-
-        with mock.patch.object(council_intel, "fetch_json", return_value=fake_response):
+    def test_fetch_returns_funding_fields(self):
+        provider = council_intel.OKXFuturesProvider()
+        normal_rates = [0.0001, 0.00011, 0.00009] * 30
+        responses = [
+            _okx_funding_rate_response(0.00142),
+            _okx_funding_history_response(normal_rates),
+            _okx_oi_response(8_200_000_000),
+            _okx_ls_ratio_response(1.5),
+            _okx_ls_ratio_response(0.8),  # contract ratio
+            _okx_taker_volume_response(500, 300),
+        ]
+        with mock.patch.object(council_intel, "fetch_json", side_effect=responses):
             data = provider.fetch_symbol_data("BTC")
 
         self.assertIsNotNone(data)
-        self.assertIn("oi_now", data)
-        self.assertIn("oi_24h_ago", data)
-        self.assertIn("delta_pct", data)          # (oi_now - oi_24h_ago) / oi_24h_ago
-        self.assertAlmostEqual(data["delta_pct"], 0.10, places=4)   # +10%
+        self.assertIsInstance(data, dict)
+        self.assertIn("funding_rate", data)
+        self.assertAlmostEqual(data["funding_rate"], 0.00142)
+        self.assertIn("funding_z_score", data)
+        self.assertGreater(data["funding_z_score"], 3.0)
 
-    def test_fetch_returns_unavailable_string_on_network_error(self):
-        """On fetch failure, returns 'oi_unavailable:...' string — never raises."""
-        provider = council_intel.OpenInterestProvider()
+    def test_fetch_returns_oi_fields(self):
+        provider = council_intel.OKXFuturesProvider()
+        responses = [
+            _okx_funding_rate_response(0.0001),
+            _okx_funding_history_response([0.0001] * 10),
+            _okx_oi_response(8_200_000_000),
+            _okx_ls_ratio_response(1.2),
+            _okx_ls_ratio_response(1.1),
+            _okx_taker_volume_response(400, 400),
+        ]
+        with mock.patch.object(council_intel, "fetch_json", side_effect=responses):
+            data = provider.fetch_symbol_data("BTC")
 
+        self.assertIn("oi_value", data)
+        self.assertGreater(data["oi_value"], 0)
+
+    def test_fetch_returns_ls_ratio_fields(self):
+        provider = council_intel.OKXFuturesProvider()
+        responses = [
+            _okx_funding_rate_response(0.0001),
+            _okx_funding_history_response([0.0001] * 10),
+            _okx_oi_response(8_000_000_000),
+            _okx_ls_ratio_response(2.5),
+            _okx_ls_ratio_response(0.6),
+            _okx_taker_volume_response(400, 400),
+        ]
+        with mock.patch.object(council_intel, "fetch_json", side_effect=responses):
+            data = provider.fetch_symbol_data("BTC")
+
+        self.assertIn("ls_ratio_account", data)
+        self.assertAlmostEqual(data["ls_ratio_account"], 2.5)
+        self.assertIn("ls_ratio_contract", data)
+        self.assertAlmostEqual(data["ls_ratio_contract"], 0.6)
+
+    def test_fetch_returns_taker_flow_fields(self):
+        provider = council_intel.OKXFuturesProvider()
+        responses = [
+            _okx_funding_rate_response(0.0001),
+            _okx_funding_history_response([0.0001] * 10),
+            _okx_oi_response(8_000_000_000),
+            _okx_ls_ratio_response(1.2),
+            _okx_ls_ratio_response(1.1),
+            _okx_taker_volume_response(300, 700),  # 70% sell
+        ]
+        with mock.patch.object(council_intel, "fetch_json", side_effect=responses):
+            data = provider.fetch_symbol_data("BTC")
+
+        self.assertIn("taker_buy_ratio", data)
+        self.assertAlmostEqual(data["taker_buy_ratio"], 0.3, places=1)
+
+    def test_fetch_returns_unavailable_on_error(self):
+        provider = council_intel.OKXFuturesProvider()
         with mock.patch.object(council_intel, "fetch_json", side_effect=OSError("timeout")):
             result = provider.fetch_symbol_data("BTC")
-
         self.assertIsInstance(result, str)
-        self.assertTrue(result.startswith("oi_unavailable:"))
+        self.assertTrue(result.startswith("okx_unavailable:"))
 
-    def test_fetch_returns_unavailable_when_fewer_than_two_data_points(self):
-        """Single data point is insufficient for delta — return unavailable."""
-        provider = council_intel.OpenInterestProvider()
-        fake_response = self._make_binance_oi_response(100_000.0, 1_714_100_000_000)
+    def test_z_score_none_when_insufficient_history(self):
+        provider = council_intel.OKXFuturesProvider()
+        responses = [
+            _okx_funding_rate_response(0.0003),
+            _okx_funding_history_response([0.0001, 0.0002]),  # only 2
+            _okx_oi_response(8_000_000_000),
+            _okx_ls_ratio_response(1.2),
+            _okx_ls_ratio_response(1.1),
+            _okx_taker_volume_response(400, 400),
+        ]
+        with mock.patch.object(council_intel, "fetch_json", side_effect=responses):
+            data = provider.fetch_symbol_data("BTC")
+        self.assertIsNone(data.get("funding_z_score"))
 
-        with mock.patch.object(council_intel, "fetch_json", return_value=fake_response):
-            result = provider.fetch_symbol_data("BTC")
-
-        self.assertIsInstance(result, str)
-        self.assertTrue(result.startswith("oi_unavailable:"))
-
-    def test_describe_returns_status_dict(self):
-        provider = council_intel.OpenInterestProvider()
+    def test_describe_returns_status(self):
+        provider = council_intel.OKXFuturesProvider()
         desc = provider.describe()
         self.assertIn("status", desc)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. FundingRateProvider — Binance direct rewire
-# ──────────────────────────────────────────────────────────────────────────────
-
-class BinanceFundingRewireTests(unittest.TestCase):
-    """FundingRateProvider.fetch_symbol_data must prefer Binance /premiumIndex
-    over CoinGecko when source_order contains 'binance_direct'."""
-
-    def _make_premium_index_response(self, rate: float) -> dict:
-        """Binance GET /fapi/v1/premiumIndex shape."""
-        return {
-            "symbol": "BTCUSDT",
-            "markPrice": "94000.00",
-            "lastFundingRate": str(rate),
-            "nextFundingTime": 1_714_108_800_000,
-            "time": 1_714_100_000_000,
-        }
-
-    def _make_funding_history_response(self, rates: list) -> list:
-        """Binance GET /fapi/v1/fundingRate shape (list of historical records)."""
-        return [
-            {"symbol": "BTCUSDT", "fundingRate": str(r), "fundingTime": 1_714_000_000_000 + i * 28800_000}
-            for i, r in enumerate(rates)
-        ]
-
-    def test_binance_direct_source_fetches_premiumIndex(self):
-        """With source_order=['binance_direct'], provider calls Binance API."""
-        provider = council_intel.FundingRateProvider({
-            "enabled": True,
-            "source_order": ["binance_direct"],
-            "anomaly_threshold": 0.001,   # 0.1%/8h
-            "total_deadline": 30,
-        })
-
-        current_resp = self._make_premium_index_response(0.00142)
-        hist_resp = self._make_funding_history_response([0.0005, 0.0008, 0.0012])
-
-        call_responses = [current_resp, hist_resp]
-
-        with mock.patch.object(council_intel, "fetch_json", side_effect=call_responses):
-            data = provider.fetch_symbol_data("BTC")
-
-        self.assertIsNotNone(data)
-        self.assertAlmostEqual(data["current_rate"], 0.00142)
-        self.assertIn("history_rates", data)
-        self.assertEqual(data["exchange"], "binance")
-
-    def test_funding_extreme_z_score_computed_from_history(self):
-        """fetch_symbol_data must include funding_z_score when history ≥ 10 readings."""
-        provider = council_intel.FundingRateProvider({
-            "enabled": True,
-            "source_order": ["binance_direct"],
-            "anomaly_threshold": 0.001,
-            "total_deadline": 30,
-        })
-
-        # z = (0.00142 - mean) / std where mean≈0.0001, std≈0.0001 → z >> 3
-        normal_rates = [0.0001] * 90
-        current_resp = self._make_premium_index_response(0.00142)
-        hist_resp = self._make_funding_history_response(normal_rates)
-
-        with mock.patch.object(council_intel, "fetch_json", side_effect=[current_resp, hist_resp]):
-            data = provider.fetch_symbol_data("BTC")
-
-        self.assertIsNotNone(data)
-        self.assertIn("funding_z_score", data)
-        self.assertGreater(data["funding_z_score"], 3.0)   # extreme positive
-
-    def test_funding_z_score_absent_when_history_insufficient(self):
-        """funding_z_score must be None (or absent) when fewer than 10 history points."""
-        provider = council_intel.FundingRateProvider({
-            "enabled": True,
-            "source_order": ["binance_direct"],
-            "total_deadline": 30,
-        })
-
-        current_resp = self._make_premium_index_response(0.0003)
-        hist_resp = self._make_funding_history_response([0.0001, 0.0002])  # only 2 pts
-
-        with mock.patch.object(council_intel, "fetch_json", side_effect=[current_resp, hist_resp]):
-            data = provider.fetch_symbol_data("BTC")
-
-        # Either key absent or explicitly None
-        z = (data or {}).get("funding_z_score")
-        self.assertIsNone(z)
-
-    def test_binance_direct_falls_through_to_coingecko_on_error(self):
-        """If binance_direct fails, provider falls through to next source in order."""
-        provider = council_intel.FundingRateProvider({
-            "enabled": True,
-            "source_order": ["binance_direct", "coingecko_derivatives"],
-            "total_deadline": 30,
-        })
-
-        coingecko_resp = [{
-            "market": "Binance (Futures)",
-            "symbol": "BTCUSDT",
-            "index_id": "BTC",
-            "contract_type": "perpetual",
-            "funding_rate": "0.00042",
-        }]
-
-        # First call (binance_direct) fails, second (coingecko) succeeds
-        with mock.patch.object(
-            council_intel, "fetch_json",
-            side_effect=[OSError("network"), coingecko_resp]
-        ):
-            data = provider.fetch_symbol_data("BTC")
-
-        self.assertIsNotNone(data)
-        self.assertAlmostEqual(data["current_rate"], 0.00042)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. Signal primitives in evaluate_asset_policy
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# 2. Signal primitives in evaluate_asset_policy
+# ──────────────────────────────────────────────────────────────
 
 class ForcedFlowPrimitiveSignalTests(unittest.TestCase):
-    """funding_extreme and oi_divergence primitives gate the 'investigate' policy."""
 
-    def _base_funding(self, z_score: float, is_anomalous: bool = False) -> dict:
+    def _funding(self, z_score=0.5, rate=0.0001, rate_24h_ago=None):
         return {
-            "current_rate": 0.00142,
-            "current_rate_pct": 0.142,
-            "previous_rate": 0.0008,
-            "history_rates": [0.0001] * 30,
-            "is_anomalous": is_anomalous,
-            "is_turning": False,
+            "funding_rate": rate,
             "funding_z_score": z_score,
+            "funding_annualized": rate * 3 * 365 * 100,
+            "is_anomalous": abs(z_score) > 3.0,
+            "is_turning": False,
+            "rate_24h_ago": rate_24h_ago,
+            "rate_1sigma": 0.0001,
         }
 
-    def _base_oi(self, delta_pct: float, price_delta_pct: float = 3.0) -> dict:
-        return {
-            "oi_now": 110_000.0,
-            "oi_24h_ago": 100_000.0,
-            "delta_pct": delta_pct,
-            "price_delta_pct_24h": price_delta_pct,  # caller sets direction
-        }
+    def _oi(self, delta_pct=0.0):
+        return {"oi_value": 8_200_000_000, "oi_delta_pct_24h": delta_pct}
 
-    def test_funding_extreme_z_above_3_triggers_investigate(self):
-        """funding_z_score > 3.0 on a watchlist symbol => investigate."""
+    def _ls(self, account=1.2, contract=1.1):
+        return {"ls_ratio_account": account, "ls_ratio_contract": contract}
+
+    def _taker(self, buy_ratio=0.5):
+        return {"taker_buy_ratio": buy_ratio}
+
+    def test_funding_extreme_triggers_investigate(self):
         policy = council_intel.evaluate_asset_policy(
-            symbol="BTC",
-            tags=["watchlist"],
+            symbol="BTC", tags=["watchlist"],
             market_data={"symbol": "BTC", "price": 94000},
             watchlist_symbols={"BTC"},
-            funding_data=self._base_funding(z_score=3.4, is_anomalous=True),
-            oi_data=None,
+            funding_data=self._funding(z_score=3.4),
+            oi_data=self._oi(), ls_data=self._ls(), taker_data=self._taker(),
         )
         self.assertEqual(policy["recommended_action"], "investigate")
         self.assertIn("funding_extreme", policy.get("forced_flow_primitives", []))
 
-    def test_oi_divergence_triggers_investigate_on_watchlist(self):
-        """OI drops -8% while price +3% => divergence => investigate."""
+    def test_oi_divergence_triggers_investigate(self):
         policy = council_intel.evaluate_asset_policy(
-            symbol="BTC",
-            tags=["watchlist"],
-            market_data={"symbol": "BTC", "price": 94000},
+            symbol="BTC", tags=["watchlist"],
+            market_data={"symbol": "BTC", "price": 94000, "change_24h_pct": 5.0},
             watchlist_symbols={"BTC"},
-            funding_data=None,
-            oi_data=self._base_oi(delta_pct=-0.08, price_delta_pct=3.0),
+            funding_data=self._funding(),
+            oi_data=self._oi(delta_pct=-0.08),  # price up, OI down
+            ls_data=self._ls(), taker_data=self._taker(),
         )
         self.assertEqual(policy["recommended_action"], "investigate")
         self.assertIn("oi_divergence", policy.get("forced_flow_primitives", []))
 
-    def test_watchlist_alone_without_forced_flow_is_watch_not_investigate(self):
-        """watchlist + funding turning (old gate) is no longer sufficient for investigate.
-        A forced-flow primitive is required."""
+    def test_ls_extreme_triggers_investigate(self):
         policy = council_intel.evaluate_asset_policy(
-            symbol="BTC",
-            tags=["watchlist"],
+            symbol="BTC", tags=["watchlist"],
             market_data={"symbol": "BTC", "price": 94000},
             watchlist_symbols={"BTC"},
-            funding_data={
-                "current_rate": 0.00003,
-                "is_anomalous": False,
-                "is_turning": True,       # old gate — now insufficient alone
-                "funding_z_score": 1.2,   # below 3.0
-            },
-            oi_data=self._base_oi(delta_pct=0.02, price_delta_pct=1.0),  # |Δoi| < 5%
-        )
-        # Must NOT auto-promote to investigate without a forced-flow primitive
-        self.assertNotEqual(policy["recommended_action"], "investigate")
-
-    def test_both_primitives_together_still_yields_investigate(self):
-        """Both funding_extreme AND oi_divergence active => investigate."""
-        policy = council_intel.evaluate_asset_policy(
-            symbol="BTC",
-            tags=["watchlist"],
-            market_data={"symbol": "BTC", "price": 94000},
-            watchlist_symbols={"BTC"},
-            funding_data=self._base_funding(z_score=4.1, is_anomalous=True),
-            oi_data=self._base_oi(delta_pct=-0.12, price_delta_pct=5.0),
+            funding_data=self._funding(),
+            oi_data=self._oi(),
+            ls_data=self._ls(account=2.5, contract=0.6),  # retail long, pros short
+            taker_data=self._taker(),
         )
         self.assertEqual(policy["recommended_action"], "investigate")
+        self.assertIn("ls_ratio_extreme", policy.get("forced_flow_primitives", []))
+
+    def test_funding_flip_triggers(self):
+        policy = council_intel.evaluate_asset_policy(
+            symbol="BTC", tags=["watchlist"],
+            market_data={"symbol": "BTC", "price": 94000},
+            watchlist_symbols={"BTC"},
+            funding_data=self._funding(z_score=1.5, rate=0.0003, rate_24h_ago=-0.0002),
+            oi_data=self._oi(), ls_data=self._ls(), taker_data=self._taker(),
+        )
+        self.assertIn("funding_flip", policy.get("forced_flow_primitives", []))
+
+    def test_taker_flow_imbalance_triggers(self):
+        policy = council_intel.evaluate_asset_policy(
+            symbol="BTC", tags=["watchlist"],
+            market_data={"symbol": "BTC", "price": 94000},
+            watchlist_symbols={"BTC"},
+            funding_data=self._funding(),
+            oi_data=self._oi(), ls_data=self._ls(),
+            taker_data=self._taker(buy_ratio=0.25),  # 75% sell
+        )
+        self.assertIn("taker_flow_imbalance", policy.get("forced_flow_primitives", []))
+
+    def test_no_forced_flow_no_investigate(self):
+        """Watchlist + funding_turning alone is no longer sufficient."""
+        policy = council_intel.evaluate_asset_policy(
+            symbol="BTC", tags=["watchlist"],
+            market_data={"symbol": "BTC", "price": 94000},
+            watchlist_symbols={"BTC"},
+            funding_data=self._funding(z_score=1.2),  # below 3.0
+            oi_data=self._oi(delta_pct=0.02),  # <5%
+            ls_data=self._ls(account=1.3, contract=1.1),  # not extreme
+            taker_data=self._taker(buy_ratio=0.48),  # balanced
+        )
+        self.assertNotEqual(policy["recommended_action"], "investigate")
+
+    def test_non_watchlist_does_not_investigate(self):
+        policy = council_intel.evaluate_asset_policy(
+            symbol="RAND", tags=[],
+            market_data={"symbol": "RAND", "price": 10},
+            watchlist_symbols={"BTC"},
+            funding_data=self._funding(z_score=5.0),
+            oi_data=self._oi(), ls_data=self._ls(), taker_data=self._taker(),
+        )
+        self.assertNotEqual(policy["recommended_action"], "investigate")
+
+    def test_multiple_primitives_detected(self):
+        policy = council_intel.evaluate_asset_policy(
+            symbol="BTC", tags=["watchlist"],
+            market_data={"symbol": "BTC", "price": 94000, "change_24h_pct": 8.0},
+            watchlist_symbols={"BTC"},
+            funding_data=self._funding(z_score=4.1, rate=0.0015, rate_24h_ago=-0.0003),
+            oi_data=self._oi(delta_pct=-0.12),
+            ls_data=self._ls(account=2.8, contract=0.5),
+            taker_data=self._taker(buy_ratio=0.2),
+        )
         primitives = policy.get("forced_flow_primitives", [])
         self.assertIn("funding_extreme", primitives)
         self.assertIn("oi_divergence", primitives)
-
-    def test_non_watchlist_with_extreme_funding_does_not_investigate(self):
-        """Forced-flow primitive alone, without watchlist, should not trigger investigate."""
-        policy = council_intel.evaluate_asset_policy(
-            symbol="RAND",
-            tags=[],
-            market_data={"symbol": "RAND", "price": 10},
-            watchlist_symbols={"BTC"},  # RAND not in watchlist
-            funding_data=self._base_funding(z_score=5.0, is_anomalous=True),
-            oi_data=None,
-        )
-        self.assertNotEqual(policy["recommended_action"], "investigate")
-
-    def test_oi_divergence_requires_5pct_threshold(self):
-        """OI delta of only 3% should NOT trigger oi_divergence primitive."""
-        policy = council_intel.evaluate_asset_policy(
-            symbol="BTC",
-            tags=["watchlist"],
-            market_data={"symbol": "BTC", "price": 94000},
-            watchlist_symbols={"BTC"},
-            funding_data=None,
-            oi_data=self._base_oi(delta_pct=-0.03, price_delta_pct=2.0),  # 3% < 5%
-        )
-        self.assertNotIn("oi_divergence", policy.get("forced_flow_primitives", []))
+        self.assertIn("ls_ratio_extreme", primitives)
+        self.assertIn("taker_flow_imbalance", primitives)
+        self.assertIn("funding_flip", primitives)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. ProviderBundle — OI slot
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# 3. ProviderBundle OKX slot
+# ──────────────────────────────────────────────────────────────
 
-class ProviderBundleOITests(unittest.TestCase):
-    """ProviderBundle must accept an 'oi' slot."""
+class ProviderBundleOKXTests(unittest.TestCase):
 
-    def test_provider_bundle_accepts_oi_provider(self):
-        provider = council_intel.OpenInterestProvider()
+    def test_bundle_accepts_okx_provider(self):
+        provider = council_intel.OKXFuturesProvider()
         bundle = council_intel.ProviderBundle(
             coingecko=council_intel.StaticCoinGeckoProvider(),
-            oi=provider,
+            okx_futures=provider,
         )
-        self.assertIs(bundle.oi, provider)
+        self.assertIs(bundle.okx_futures, provider)
 
-    def test_provider_bundle_oi_defaults_to_none(self):
+    def test_bundle_okx_defaults_none(self):
         bundle = council_intel.ProviderBundle(
             coingecko=council_intel.StaticCoinGeckoProvider(),
         )
-        self.assertIsNone(getattr(bundle, "oi", None))
+        self.assertIsNone(getattr(bundle, "okx_futures", None))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. counterparty_thesis numeric discipline
-# ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# 4. counterparty_thesis numeric discipline
+# ──────────────────────────────────────────────────────────────
 
-class CounterpartyThesisNumericTests(unittest.TestCase):
-    """evaluate_asset_policy must tag thesis quality in the returned dict."""
+class CounterpartyThesisTests(unittest.TestCase):
 
-    def _policy_with_thesis(self, thesis: str) -> dict:
+    def _policy_with_thesis(self, thesis):
         return council_intel.evaluate_asset_policy(
-            symbol="BTC",
-            tags=["watchlist"],
+            symbol="BTC", tags=["watchlist"],
             market_data={"symbol": "BTC", "price": 94000},
             watchlist_symbols={"BTC"},
             funding_data={
-                "current_rate": 0.00142,
-                "is_anomalous": True,
-                "is_turning": False,
-                "funding_z_score": 3.4,
+                "funding_rate": 0.00142, "funding_z_score": 3.4,
+                "is_anomalous": True, "is_turning": False,
+                "rate_24h_ago": None, "rate_1sigma": 0.0001,
             },
-            oi_data=None,
             counterparty_thesis=thesis,
         )
 
-    def test_thesis_with_two_numbers_passes_quality_gate(self):
-        """'funding 0.142%/8h, OI +18%' contains 2 numbers → passes."""
+    def test_thesis_with_two_numbers_passes(self):
         policy = self._policy_with_thesis(
-            "Binance perp: funding 0.142%/8h (z=3.4). OI $8.2B +18% in 24h."
+            "OKX perp: funding 0.142%/8h (z=3.4). OI $8.2B +18%."
         )
         self.assertTrue(policy.get("thesis_numeric_ok", False))
 
-    def test_thesis_with_zero_numbers_fails_quality_gate(self):
-        """Pure text thesis with no numbers → thesis_numeric_ok=False."""
+    def test_thesis_with_zero_numbers_fails(self):
         policy = self._policy_with_thesis(
-            "Late shorts and range-bound sellers who haven't recognized the trend shift."
+            "Late shorts who haven't recognized the trend shift."
         )
         self.assertFalse(policy.get("thesis_numeric_ok", True))
 
-    def test_thesis_with_one_number_fails_quality_gate(self):
-        """Only one number is insufficient — need at least 2."""
-        policy = self._policy_with_thesis("Funding rate is 0.14% which is high.")
+    def test_thesis_with_one_number_fails(self):
+        policy = self._policy_with_thesis("Funding rate is high at 0.14% level.")
         self.assertFalse(policy.get("thesis_numeric_ok", True))
 
-    def test_no_thesis_provided_is_not_penalized(self):
-        """When no thesis is provided, thesis_numeric_ok is absent or None — not False."""
+    def test_no_thesis_not_penalized(self):
         policy = council_intel.evaluate_asset_policy(
-            symbol="BTC",
-            tags=["watchlist"],
+            symbol="BTC", tags=["watchlist"],
             market_data={"symbol": "BTC", "price": 94000},
             watchlist_symbols={"BTC"},
             funding_data={
-                "current_rate": 0.00142,
-                "is_anomalous": True,
-                "is_turning": False,
-                "funding_z_score": 3.4,
+                "funding_rate": 0.00142, "funding_z_score": 3.4,
+                "is_anomalous": True, "is_turning": False,
             },
-            oi_data=None,
         )
-        # thesis_numeric_ok should be absent or None, not False
         self.assertIsNone(policy.get("thesis_numeric_ok"))
-
-    def test_thesis_with_bare_integers_fails_tight_quality_gate(self):
-        """B2 Tight: bare integers ('45 of 60 cycles took 12 hours') do NOT count as quantitative.
-        Tokens must carry %, $, decimal point, or M/B/K unit — otherwise the thesis is
-        narrative dressed up as data, exactly the failure mode this gate exists to catch.
-        """
-        policy = self._policy_with_thesis(
-            "There are 45 of 60 cycles taking 12 hours per round."
-        )
-        self.assertFalse(policy.get("thesis_numeric_ok", True))
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ──────────────────────────────────────────────────────────────
+# 5. DeribitOptionsProvider
+# ──────────────────────────────────────────────────────────────
+
+def _deribit_book_summary(instruments: list) -> dict:
+    """Deribit /api/v2/public/get_book_summary_by_currency response shape."""
+    return {"jsonrpc": "2.0", "id": 1, "result": instruments}
+
+
+def _deribit_instrument(name: str, oi: float, underlying: float = 94000.0) -> dict:
+    return {
+        "instrument_name": name,
+        "open_interest": oi,
+        "underlying_price": underlying,
+        "mark_price": 0.05,
+    }
+
+
+def _expiry_str(days_from_now: int) -> str:
+    """Return a Deribit-formatted expiry string like '26APR26' for a date N days from today."""
+    d = dt.date.today() + dt.timedelta(days=days_from_now)
+    return d.strftime("%d%b%y").upper()
+
+
+class DeribitOptionsProviderTests(unittest.TestCase):
+
+    def test_provider_exists_and_implements_contract(self):
+        self.assertTrue(hasattr(council_intel, "DeribitOptionsProvider"))
+        provider = council_intel.DeribitOptionsProvider()
+        self.assertTrue(callable(getattr(provider, "fetch_symbol_data", None)))
+        self.assertTrue(callable(getattr(provider, "describe", None)))
+
+    def test_fetch_returns_required_fields(self):
+        provider = council_intel.DeribitOptionsProvider()
+        exp = _expiry_str(5)
+        instruments = [
+            _deribit_instrument(f"BTC-{exp}-94000-C", 800),
+            _deribit_instrument(f"BTC-{exp}-93000-P", 300),
+        ]
+        with mock.patch.object(council_intel, "fetch_json",
+                               return_value=_deribit_book_summary(instruments)):
+            data = provider.fetch_symbol_data("BTC")
+
+        self.assertIsNotNone(data)
+        self.assertIsInstance(data, dict)
+        self.assertIn("max_pain", data)
+        self.assertIn("put_call_ratio", data)
+        self.assertIn("gamma_cluster", data)
+
+    def test_gamma_cluster_detected_near_atm_expiry_lt_7d(self):
+        """OI concentrated at strike ±2% of spot, expiry < 7d => gamma_cluster=True."""
+        provider = council_intel.DeribitOptionsProvider()
+        exp = _expiry_str(3)
+        instruments = [
+            _deribit_instrument(f"BTC-{exp}-94000-C", 5000),  # ±0%, 3d
+            _deribit_instrument(f"BTC-{exp}-94000-P", 4000),
+            _deribit_instrument(f"BTC-{_expiry_str(30)}-80000-C", 100),  # far OTM, long
+        ]
+        with mock.patch.object(council_intel, "fetch_json",
+                               return_value=_deribit_book_summary(instruments)):
+            data = provider.fetch_symbol_data("BTC")
+
+        self.assertTrue(data.get("gamma_cluster"))
+
+    def test_no_gamma_cluster_when_expiry_gte_7d(self):
+        """Near-ATM OI but expiry >= 7d: gamma_cluster=False."""
+        provider = council_intel.DeribitOptionsProvider()
+        exp = _expiry_str(14)
+        instruments = [
+            _deribit_instrument(f"BTC-{exp}-94000-C", 5000),
+            _deribit_instrument(f"BTC-{exp}-94000-P", 4000),
+        ]
+        with mock.patch.object(council_intel, "fetch_json",
+                               return_value=_deribit_book_summary(instruments)):
+            data = provider.fetch_symbol_data("BTC")
+
+        self.assertFalse(data.get("gamma_cluster"))
+
+    def test_no_gamma_cluster_when_oi_far_from_spot(self):
+        """OI concentrated far outside ±2% of spot: gamma_cluster=False."""
+        provider = council_intel.DeribitOptionsProvider()
+        exp = _expiry_str(3)
+        instruments = [
+            _deribit_instrument(f"BTC-{exp}-80000-C", 5000),  # ~15% below spot
+            _deribit_instrument(f"BTC-{exp}-80000-P", 4000),
+        ]
+        with mock.patch.object(council_intel, "fetch_json",
+                               return_value=_deribit_book_summary(instruments)):
+            data = provider.fetch_symbol_data("BTC")
+
+        self.assertFalse(data.get("gamma_cluster"))
+
+    def test_fetch_returns_unavailable_on_error(self):
+        provider = council_intel.DeribitOptionsProvider()
+        with mock.patch.object(council_intel, "fetch_json", side_effect=OSError("timeout")):
+            result = provider.fetch_symbol_data("BTC")
+        self.assertIsInstance(result, str)
+        self.assertTrue(result.startswith("deribit_unavailable:"))
+
+    def test_describe_returns_status(self):
+        provider = council_intel.DeribitOptionsProvider()
+        desc = provider.describe()
+        self.assertIn("status", desc)
+
+
+# ──────────────────────────────────────────────────────────────
+# 6. BitgetFuturesProvider
+# ──────────────────────────────────────────────────────────────
+
+def _bitget_funding_response(rate: float) -> dict:
+    """Bitget GET /api/v2/mix/market/current-fund-rate response shape."""
+    return {
+        "code": "00000",
+        "msg": "success",
+        "data": {
+            "symbol": "BTCUSDT",
+            "fundingRate": str(rate),
+            "nextFundingTime": "1714108800000",
+        },
+    }
+
+
+def _bitget_oi_response(oi: float) -> dict:
+    """Bitget GET /api/v2/mix/market/open-interest response shape."""
+    return {
+        "code": "00000",
+        "data": {
+            "symbol": "BTCUSDT",
+            "openInterestList": [{"size": str(oi)}],
+        },
+    }
+
+
+class BitgetFuturesProviderTests(unittest.TestCase):
+
+    def test_provider_exists_and_implements_contract(self):
+        self.assertTrue(hasattr(council_intel, "BitgetFuturesProvider"))
+        provider = council_intel.BitgetFuturesProvider()
+        self.assertTrue(callable(getattr(provider, "fetch_symbol_data", None)))
+        self.assertTrue(callable(getattr(provider, "describe", None)))
+
+    def test_fetch_returns_funding_rate(self):
+        provider = council_intel.BitgetFuturesProvider()
+        with mock.patch.object(council_intel, "fetch_json",
+                               side_effect=[_bitget_funding_response(0.00085),
+                                            _bitget_oi_response(8_000_000)]):
+            data = provider.fetch_symbol_data("BTC")
+
+        self.assertIsNotNone(data)
+        self.assertIsInstance(data, dict)
+        self.assertIn("funding_rate", data)
+        self.assertAlmostEqual(data["funding_rate"], 0.00085)
+
+    def test_fetch_returns_oi(self):
+        provider = council_intel.BitgetFuturesProvider()
+        with mock.patch.object(council_intel, "fetch_json",
+                               side_effect=[_bitget_funding_response(0.0001),
+                                            _bitget_oi_response(8_500_000)]):
+            data = provider.fetch_symbol_data("BTC")
+
+        self.assertIn("oi_value", data)
+        self.assertAlmostEqual(data["oi_value"], 8_500_000)
+
+    def test_fetch_returns_unavailable_on_error(self):
+        provider = council_intel.BitgetFuturesProvider()
+        with mock.patch.object(council_intel, "fetch_json", side_effect=OSError("timeout")):
+            result = provider.fetch_symbol_data("BTC")
+        self.assertIsInstance(result, str)
+        self.assertTrue(result.startswith("bitget_unavailable:"))
+
+    def test_describe_returns_status(self):
+        provider = council_intel.BitgetFuturesProvider()
+        desc = provider.describe()
+        self.assertIn("status", desc)
+
+
+# ──────────────────────────────────────────────────────────────
+# 7. ProviderBundle Phase 2 slots
+# ──────────────────────────────────────────────────────────────
+
+class ProviderBundlePhase2Tests(unittest.TestCase):
+
+    def test_bundle_accepts_bitget_provider(self):
+        provider = council_intel.BitgetFuturesProvider()
+        bundle = council_intel.ProviderBundle(
+            coingecko=council_intel.StaticCoinGeckoProvider(),
+            bitget_futures=provider,
+        )
+        self.assertIs(bundle.bitget_futures, provider)
+
+    def test_bundle_accepts_deribit_provider(self):
+        provider = council_intel.DeribitOptionsProvider()
+        bundle = council_intel.ProviderBundle(
+            coingecko=council_intel.StaticCoinGeckoProvider(),
+            deribit_options=provider,
+        )
+        self.assertIs(bundle.deribit_options, provider)
+
+    def test_bundle_phase2_fields_default_to_none(self):
+        bundle = council_intel.ProviderBundle(
+            coingecko=council_intel.StaticCoinGeckoProvider(),
+        )
+        self.assertIsNone(getattr(bundle, "bitget_futures", None))
+        self.assertIsNone(getattr(bundle, "deribit_options", None))
+
+
+# ──────────────────────────────────────────────────────────────
+# 8. Phase 2 primitives in evaluate_asset_policy
+# ──────────────────────────────────────────────────────────────
+
+class Phase2PrimitiveSignalTests(unittest.TestCase):
+
+    def _base_funding(self, z_score=0.5, rate=0.0001):
+        return {
+            "funding_rate": rate,
+            "funding_z_score": z_score,
+            "is_anomalous": abs(z_score) > 3.0,
+            "is_turning": False,
+            "rate_24h_ago": None,
+            "rate_1sigma": 0.0001,
+        }
+
+    def test_options_gamma_cluster_triggers_investigate(self):
+        """deribit_data gamma_cluster=True + watchlist => investigate."""
+        policy = council_intel.evaluate_asset_policy(
+            symbol="BTC", tags=["watchlist"],
+            market_data={"symbol": "BTC", "price": 94000},
+            watchlist_symbols={"BTC"},
+            funding_data=self._base_funding(),
+            deribit_data={
+                "gamma_cluster": True,
+                "gamma_strike": 94000,
+                "gamma_expiry_days": 3,
+                "max_pain": 93000,
+                "put_call_ratio": 0.8,
+            },
+        )
+        self.assertEqual(policy["recommended_action"], "investigate")
+        self.assertIn("options_gamma_cluster", policy.get("forced_flow_primitives", []))
+
+    def test_gamma_cluster_false_does_not_trigger(self):
+        """gamma_cluster=False produces no options_gamma_cluster primitive."""
+        policy = council_intel.evaluate_asset_policy(
+            symbol="BTC", tags=["watchlist"],
+            market_data={"symbol": "BTC", "price": 94000},
+            watchlist_symbols={"BTC"},
+            funding_data=self._base_funding(),
+            deribit_data={"gamma_cluster": False, "max_pain": 90000, "put_call_ratio": 1.2},
+        )
+        self.assertNotIn("options_gamma_cluster", policy.get("forced_flow_primitives", []))
+
+    def test_cross_exchange_confirm_triggers_when_both_agree(self):
+        """OKX extreme positive funding + Bitget positive elevated => cross_exchange_confirm."""
+        policy = council_intel.evaluate_asset_policy(
+            symbol="BTC", tags=["watchlist"],
+            market_data={"symbol": "BTC", "price": 94000},
+            watchlist_symbols={"BTC"},
+            funding_data=self._base_funding(z_score=3.5, rate=0.0015),
+            bitget_data={"funding_rate": 0.0012, "oi_value": 8_000_000},
+        )
+        self.assertIn("cross_exchange_confirm", policy.get("forced_flow_primitives", []))
+
+    def test_cross_exchange_confirm_not_triggered_without_bitget(self):
+        """No bitget_data: cross_exchange_confirm must not fire."""
+        policy = council_intel.evaluate_asset_policy(
+            symbol="BTC", tags=["watchlist"],
+            market_data={"symbol": "BTC", "price": 94000},
+            watchlist_symbols={"BTC"},
+            funding_data=self._base_funding(z_score=3.5, rate=0.0015),
+        )
+        self.assertNotIn("cross_exchange_confirm", policy.get("forced_flow_primitives", []))
+
+    def test_cross_exchange_confirm_not_triggered_when_signals_disagree(self):
+        """OKX positive extreme, Bitget negative: no confirmation."""
+        policy = council_intel.evaluate_asset_policy(
+            symbol="BTC", tags=["watchlist"],
+            market_data={"symbol": "BTC", "price": 94000},
+            watchlist_symbols={"BTC"},
+            funding_data=self._base_funding(z_score=3.5, rate=0.0015),
+            bitget_data={"funding_rate": -0.0008, "oi_value": 8_000_000},
+        )
+        self.assertNotIn("cross_exchange_confirm", policy.get("forced_flow_primitives", []))

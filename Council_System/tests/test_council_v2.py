@@ -559,3 +559,402 @@ class IronLawsStrictDefaultsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ══════════════════════════════════════════════════════════════
+# Phase 3 — Forced-Flow Agent Rewire + New Agents
+# ══════════════════════════════════════════════════════════════
+
+class StaticOKXBridge:
+    """Test stub that exposes all three bridge methods."""
+
+    def __init__(self, okx_data=None, deribit_data=None, funding_data=None):
+        self._okx = okx_data
+        self._deribit = deribit_data
+        self._funding = funding_data
+
+    def get_okx_data(self, symbol):
+        _ = symbol
+        return self._okx
+
+    def get_deribit_data(self, symbol):
+        _ = symbol
+        return self._deribit
+
+    def get_funding(self, symbol):
+        _ = symbol
+        return self._funding
+
+
+def _flat_snap(price: float = 50000.0) -> council_v2.MarketSnapshot:
+    candles = [(1000 + i, price, price * 1.001, price * 0.999, price, 100.0) for i in range(60)]
+    return council_v2.MarketSnapshot(symbol="BTC/USDT", ts=1059, price=price, ohlcv=candles)
+
+
+def _trending_up_snap() -> council_v2.MarketSnapshot:
+    """Closes go 48000 → ~49180 (clear uptrend)."""
+    candles = []
+    for i in range(60):
+        p = 48000.0 + i * 20.0
+        candles.append((1000 + i, p, p * 1.001, p * 0.999, p, 100.0))
+    return council_v2.MarketSnapshot(symbol="BTC/USDT", ts=1059, price=candles[-1][4], ohlcv=candles)
+
+
+def _trending_down_snap() -> council_v2.MarketSnapshot:
+    """Closes go 52000 → ~50820 (clear downtrend)."""
+    candles = []
+    for i in range(60):
+        p = 52000.0 - i * 20.0
+        candles.append((1000 + i, p, p * 1.001, p * 0.999, p, 100.0))
+    return council_v2.MarketSnapshot(symbol="BTC/USDT", ts=1059, price=candles[-1][4], ohlcv=candles)
+
+
+# ──────────────────────────────────────────────────────────────
+# FundingFlowAgent — rewired to use OKX z-score + funding_flip
+# ──────────────────────────────────────────────────────────────
+
+class Phase3FundingFlowAgentTests(unittest.TestCase):
+
+    def _okx(self, z_score, rate, rate_24h_ago=None, sigma=0.0001):
+        return {
+            "funding_rate": rate,
+            "funding_z_score": z_score,
+            "is_anomalous": abs(z_score) > 3.0,
+            "rate_24h_ago": rate_24h_ago,
+            "rate_1sigma": sigma,
+        }
+
+    def test_extreme_positive_z_signals_short(self):
+        """z > 3.0 → longs overextended → SHORT."""
+        bridge = StaticOKXBridge(okx_data=self._okx(z_score=3.5, rate=0.00142))
+        verdict = council_v2.FundingFlowAgent(bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.SHORT)
+
+    def test_extreme_negative_z_signals_long(self):
+        """z < -3.0 → shorts overextended → LONG."""
+        bridge = StaticOKXBridge(okx_data=self._okx(z_score=-3.5, rate=-0.00142))
+        verdict = council_v2.FundingFlowAgent(bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.LONG)
+
+    def test_funding_flip_neg_to_pos_signals_long(self):
+        """Funding flipped neg→pos AND |now| > 1σ → shorts being squeezed → LONG."""
+        bridge = StaticOKXBridge(okx_data=self._okx(
+            z_score=1.5, rate=0.0003, rate_24h_ago=-0.0002, sigma=0.0001))
+        verdict = council_v2.FundingFlowAgent(bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.LONG)
+
+    def test_funding_flip_pos_to_neg_signals_short(self):
+        """Funding flipped pos→neg AND |now| > 1σ → longs being flushed → SHORT."""
+        bridge = StaticOKXBridge(okx_data=self._okx(
+            z_score=-1.5, rate=-0.0003, rate_24h_ago=0.0002, sigma=0.0001))
+        verdict = council_v2.FundingFlowAgent(bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.SHORT)
+
+    def test_okx_non_hold_thesis_has_numeric_tokens(self):
+        """Non-HOLD verdict from OKX data must carry ≥2 numeric tokens in counterparty_thesis."""
+        import re
+        bridge = StaticOKXBridge(okx_data=self._okx(z_score=3.5, rate=0.00142))
+        verdict = council_v2.FundingFlowAgent(bridge).decide(_flat_snap())
+        self.assertNotEqual(verdict.action, council_v2.Action.HOLD)
+        pat = re.compile(r'\d+(?:\.\d+)?\s*%|\d+\.\d+|\$\s*\d+')
+        self.assertGreaterEqual(
+            len(pat.findall(verdict.counterparty_thesis)), 2,
+            f"Expected ≥2 numeric tokens in: {verdict.counterparty_thesis}",
+        )
+
+    def test_moderate_z_no_flip_is_hold_or_moderate(self):
+        """z = 1.5, no flip → not a forced-flow extreme (may still signal moderate flow)."""
+        bridge = StaticOKXBridge(okx_data=self._okx(
+            z_score=1.5, rate=0.0002, rate_24h_ago=0.0001))
+        verdict = council_v2.FundingFlowAgent(bridge).decide(_flat_snap())
+        # Must NOT flag as extreme (no funding_extreme)
+        self.assertNotIn(
+            verdict.action, [council_v2.Action.SHORT],
+            "Moderate z=1.5 must not signal extreme short",
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# LiquidationPressureAgent — rewired to ls_ratio + taker_flow
+# ──────────────────────────────────────────────────────────────
+
+class Phase3LiquidationPressureAgentTests(unittest.TestCase):
+
+    def _okx(self, ls_acct, ls_cont, taker_buy, funding_rate=0.0003):
+        return {
+            "funding_rate": funding_rate,
+            "funding_z_score": 1.5,
+            "ls_ratio_account": ls_acct,
+            "ls_ratio_contract": ls_cont,
+            "taker_buy_ratio": taker_buy,
+            "oi_value": 8_200_000_000,
+            "is_anomalous": False,
+        }
+
+    def test_ls_extreme_retail_long_signals_short(self):
+        """account > 2.0 AND contract < 0.8: retail crowded long, pros short → SHORT."""
+        bridge = StaticOKXBridge(okx_data=self._okx(ls_acct=2.5, ls_cont=0.6, taker_buy=0.45))
+        verdict = council_v2.LiquidationPressureAgent(bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.SHORT)
+
+    def test_ls_extreme_retail_short_signals_long(self):
+        """account < 0.5 AND contract > 1.25: retail crowded short, pros long → LONG."""
+        bridge = StaticOKXBridge(okx_data=self._okx(ls_acct=0.4, ls_cont=1.5, taker_buy=0.55))
+        verdict = council_v2.LiquidationPressureAgent(bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.LONG)
+
+    def test_taker_sell_imbalance_signals_short(self):
+        """taker_buy_ratio < 0.3: 70%+ active sellers → SHORT."""
+        bridge = StaticOKXBridge(okx_data=self._okx(ls_acct=1.2, ls_cont=1.1, taker_buy=0.2))
+        verdict = council_v2.LiquidationPressureAgent(bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.SHORT)
+
+    def test_taker_buy_imbalance_signals_long(self):
+        """taker_buy_ratio > 0.7: 70%+ active buyers → LONG."""
+        bridge = StaticOKXBridge(okx_data=self._okx(ls_acct=1.2, ls_cont=1.1, taker_buy=0.8))
+        verdict = council_v2.LiquidationPressureAgent(bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.LONG)
+
+    def test_balanced_conditions_is_hold(self):
+        """Balanced ls_ratio and taker_flow: no forced pressure → HOLD."""
+        bridge = StaticOKXBridge(okx_data=self._okx(ls_acct=1.3, ls_cont=1.1, taker_buy=0.48))
+        verdict = council_v2.LiquidationPressureAgent(bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.HOLD)
+
+    def test_okx_non_hold_thesis_has_numeric_tokens(self):
+        """Non-HOLD verdict must carry ≥2 numeric tokens."""
+        import re
+        bridge = StaticOKXBridge(okx_data=self._okx(ls_acct=2.5, ls_cont=0.6, taker_buy=0.45))
+        verdict = council_v2.LiquidationPressureAgent(bridge).decide(_flat_snap())
+        self.assertNotEqual(verdict.action, council_v2.Action.HOLD)
+        pat = re.compile(r'\d+(?:\.\d+)?\s*%|\d+\.\d+|\$\s*\d+')
+        self.assertGreaterEqual(
+            len(pat.findall(verdict.counterparty_thesis)), 2,
+            f"Expected ≥2 numeric tokens in: {verdict.counterparty_thesis}",
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# RiskAgent — adds gamma cluster veto
+# ──────────────────────────────────────────────────────────────
+
+class Phase3RiskAgentTests(unittest.TestCase):
+
+    def test_gamma_cluster_veto_returns_high_conf_hold(self):
+        """Active gamma cluster → HOLD with conf ≥ 0.85 (triggers MIN_CONF escalation)."""
+        bridge = StaticOKXBridge(deribit_data={
+            "gamma_cluster": True,
+            "gamma_strike": 50000,
+            "gamma_expiry_days": 2,
+            "max_pain": 50500,
+            "put_call_ratio": 0.9,
+        })
+        verdict = council_v2.RiskAgent(vol_lookback=30, intel_bridge=bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.HOLD)
+        self.assertGreaterEqual(verdict.confidence, 0.85)
+
+    def test_no_gamma_cluster_does_not_force_veto(self):
+        """gamma_cluster=False → RiskAgent uses vol logic, not a hard veto."""
+        bridge = StaticOKXBridge(deribit_data={"gamma_cluster": False})
+        verdict = council_v2.RiskAgent(vol_lookback=30, intel_bridge=bridge).decide(_flat_snap())
+        # Flat candles → low vol → not a high-conf HOLD veto
+        if verdict.action == council_v2.Action.HOLD:
+            self.assertLess(verdict.confidence, 0.85,
+                            "Low-vol HOLD must not mimic the gamma veto threshold")
+
+    def test_risk_agent_accepts_intel_bridge_kwarg(self):
+        """RiskAgent constructor must accept intel_bridge=None without error."""
+        agent = council_v2.RiskAgent(vol_lookback=30, intel_bridge=None)
+        self.assertIsNotNone(agent)
+
+
+# ──────────────────────────────────────────────────────────────
+# OIFlowAgent (new)
+# ──────────────────────────────────────────────────────────────
+
+class OIFlowAgentTests(unittest.TestCase):
+
+    def _okx(self, oi_delta_pct):
+        return {
+            "funding_rate": 0.0001,
+            "funding_z_score": 0.5,
+            "oi_value": 8_200_000_000,
+            "oi_delta_pct_24h": oi_delta_pct,
+            "taker_buy_ratio": 0.5,
+        }
+
+    def test_agent_exists(self):
+        self.assertTrue(hasattr(council_v2, "OIFlowAgent"))
+        agent = council_v2.OIFlowAgent(None)
+        self.assertTrue(callable(getattr(agent, "decide", None)))
+
+    def test_price_up_oi_down_signals_short(self):
+        """Price uptrend + OI delta -8%: distribution → SHORT."""
+        bridge = StaticOKXBridge(okx_data=self._okx(-0.08))
+        verdict = council_v2.OIFlowAgent(bridge).decide(_trending_up_snap())
+        self.assertEqual(verdict.action, council_v2.Action.SHORT)
+
+    def test_price_down_oi_up_signals_long(self):
+        """Price downtrend + OI delta +8%: smart accumulation → LONG."""
+        bridge = StaticOKXBridge(okx_data=self._okx(0.08))
+        verdict = council_v2.OIFlowAgent(bridge).decide(_trending_down_snap())
+        self.assertEqual(verdict.action, council_v2.Action.LONG)
+
+    def test_small_oi_delta_is_hold(self):
+        """OI delta 3% (below 5% threshold) → HOLD."""
+        bridge = StaticOKXBridge(okx_data=self._okx(0.03))
+        verdict = council_v2.OIFlowAgent(bridge).decide(_trending_up_snap())
+        self.assertEqual(verdict.action, council_v2.Action.HOLD)
+
+    def test_no_bridge_is_hold(self):
+        verdict = council_v2.OIFlowAgent(None).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.HOLD)
+
+    def test_no_okx_data_is_hold(self):
+        bridge = StaticOKXBridge(okx_data=None)
+        verdict = council_v2.OIFlowAgent(bridge).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.HOLD)
+
+    def test_non_hold_thesis_has_numeric_tokens(self):
+        import re
+        bridge = StaticOKXBridge(okx_data=self._okx(-0.08))
+        verdict = council_v2.OIFlowAgent(bridge).decide(_trending_up_snap())
+        self.assertNotEqual(verdict.action, council_v2.Action.HOLD)
+        pat = re.compile(r'\d+(?:\.\d+)?\s*%|\d+\.\d+|\$\s*\d+')
+        self.assertGreaterEqual(len(pat.findall(verdict.counterparty_thesis)), 2,
+                                f"Thesis: {verdict.counterparty_thesis}")
+
+
+# ──────────────────────────────────────────────────────────────
+# OptionsGammaAgent (new)
+# ──────────────────────────────────────────────────────────────
+
+class OptionsGammaAgentTests(unittest.TestCase):
+
+    def _deribit(self, max_pain, gamma_cluster=True):
+        return {
+            "gamma_cluster": gamma_cluster,
+            "gamma_strike": 50000,
+            "gamma_expiry_days": 3,
+            "max_pain": max_pain,
+            "put_call_ratio": 0.9,
+        }
+
+    def test_agent_exists(self):
+        self.assertTrue(hasattr(council_v2, "OptionsGammaAgent"))
+        agent = council_v2.OptionsGammaAgent(None)
+        self.assertTrue(callable(getattr(agent, "decide", None)))
+
+    def test_price_below_max_pain_is_long(self):
+        """Price 50000 < max_pain 51000 → gamma magnet pulls up → LONG."""
+        bridge = StaticOKXBridge(deribit_data=self._deribit(max_pain=51000))
+        verdict = council_v2.OptionsGammaAgent(bridge).decide(_flat_snap(50000))
+        self.assertEqual(verdict.action, council_v2.Action.LONG)
+
+    def test_price_above_max_pain_is_short(self):
+        """Price 50000 > max_pain 49000 → gamma magnet pulls down → SHORT."""
+        bridge = StaticOKXBridge(deribit_data=self._deribit(max_pain=49000))
+        verdict = council_v2.OptionsGammaAgent(bridge).decide(_flat_snap(50000))
+        self.assertEqual(verdict.action, council_v2.Action.SHORT)
+
+    def test_no_gamma_cluster_is_hold(self):
+        bridge = StaticOKXBridge(deribit_data=self._deribit(max_pain=51000, gamma_cluster=False))
+        verdict = council_v2.OptionsGammaAgent(bridge).decide(_flat_snap(50000))
+        self.assertEqual(verdict.action, council_v2.Action.HOLD)
+
+    def test_no_bridge_is_hold(self):
+        verdict = council_v2.OptionsGammaAgent(None).decide(_flat_snap())
+        self.assertEqual(verdict.action, council_v2.Action.HOLD)
+
+    def test_non_hold_thesis_has_numeric_tokens(self):
+        import re
+        bridge = StaticOKXBridge(deribit_data=self._deribit(max_pain=51000))
+        verdict = council_v2.OptionsGammaAgent(bridge).decide(_flat_snap(50000))
+        self.assertNotEqual(verdict.action, council_v2.Action.HOLD)
+        pat = re.compile(r'\d+(?:\.\d+)?\s*%|\d+\.\d+|\$\s*\d+')
+        self.assertGreaterEqual(len(pat.findall(verdict.counterparty_thesis)), 2,
+                                f"Thesis: {verdict.counterparty_thesis}")
+
+
+# ──────────────────────────────────────────────────────────────
+# JudgeAgent — Phase 3 weights
+# ──────────────────────────────────────────────────────────────
+
+class JudgeWeightsPhase3Tests(unittest.TestCase):
+
+    def test_trend_agent_weight_is_half(self):
+        """TrendAgent downweighted to 0.5 — chart data is crowded signal."""
+        self.assertEqual(council_v2.JudgeAgent().weights.get("TrendAgent"), 0.5)
+
+    def test_oi_flow_agent_weight_is_point_nine(self):
+        self.assertEqual(council_v2.JudgeAgent().weights.get("OIFlowAgent"), 0.9)
+
+    def test_options_gamma_agent_weight_is_point_seven(self):
+        self.assertEqual(council_v2.JudgeAgent().weights.get("OptionsGammaAgent"), 0.7)
+
+
+# ──────────────────────────────────────────────────────────────
+# PhilosophyGuardian — numeric thesis discipline
+# ──────────────────────────────────────────────────────────────
+
+class GuardianNumericThesisTests(unittest.TestCase):
+
+    @staticmethod
+    def _guardian():
+        return council_v2.PhilosophyGuardian(
+            laws=council_v2.IronLaws(),
+            fees=council_v2.Fees(),
+            risk=council_v2.RiskConfig(),
+        )
+
+    @staticmethod
+    def _passing_consensus():
+        return council_v2.Consensus(
+            action=council_v2.Action.LONG,
+            confidence=0.80,
+            agree_count=5,
+            total_agents=7,
+            agreement_ratio=0.71,
+            notes=[],
+            raw=[
+                council_v2.Verdict("RiskAgent", council_v2.Action.LONG, 0.60, "low_vol"),
+            ],
+            counterparty_thesis="placeholder",
+        )
+
+    @staticmethod
+    def _plan(thesis: str) -> council_v2.TradePlan:
+        return council_v2.TradePlan(
+            action=council_v2.Action.LONG,
+            symbol="BTC/USDT",
+            leverage=1.0,
+            position_frac=0.10,
+            entry=50000.0,
+            stop=48000.0,
+            take=56000.0,
+            stoploss_mode="server",
+            expected_profit=600.0,
+            expected_cost=100.0,
+            counterparty_thesis=thesis,
+        )
+
+    def test_non_numeric_thesis_is_vetoed(self):
+        """Pure-text thesis with no numeric data points → WEAK_THESIS veto."""
+        ok, reasons = self._guardian().evaluate(
+            self._passing_consensus(),
+            self._plan("Late shorts who haven't recognized the trend shift."),
+        )
+        self.assertFalse(ok)
+        self.assertTrue(any("WEAK_THESIS" in r for r in reasons),
+                        f"Expected WEAK_THESIS in {reasons}")
+
+    def test_numeric_thesis_passes_check(self):
+        """Thesis with ≥2 numeric tokens must not trigger WEAK_THESIS veto."""
+        _, reasons = self._guardian().evaluate(
+            self._passing_consensus(),
+            self._plan(
+                "Funding z=3.5σ (0.142%/8h). OI $8.2B diverging -8%. Shorts face squeeze."
+            ),
+        )
+        self.assertFalse(any("WEAK_THESIS" in r for r in reasons),
+                         f"Numeric thesis should not be vetoed, got: {reasons}")

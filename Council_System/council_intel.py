@@ -433,10 +433,368 @@ class FundingRateProvider:
         return False
 
 
+class OKXFuturesProvider:
+    """OKX perpetual swap public data — primary source for Malaysia.
+
+    All endpoints are free and require no API key.
+    Base: https://www.okx.com
+    """
+
+    BASE = "https://www.okx.com"
+    MIN_HISTORY_FOR_Z = 10
+
+    def __init__(self, cfg: Optional[Dict] = None):
+        cfg = cfg or {}
+        self.request_timeout = int(cfg.get("request_timeout", 8))
+        self._last_error: Optional[str] = None
+
+    @staticmethod
+    def _to_okx_inst_id(symbol: str) -> str:
+        """Map symbol like 'BTC' or 'BTC/USDT' to OKX instId."""
+        base = normalize_symbol(symbol).replace("/USDT", "").replace("USDT", "")
+        return f"{base}-USDT-SWAP"
+
+    def fetch_symbol_data(self, symbol: str, query_pack: Optional[str] = None) -> Any:
+        """Fetch funding + OI + LS ratio + taker flow from OKX.
+
+        Returns dict on success, or 'okx_unavailable:{reason}' string on failure.
+        """
+        _ = query_pack
+        inst_id = self._to_okx_inst_id(symbol)
+        result: Dict[str, Any] = {"exchange": "okx", "symbol": inst_id}
+
+        try:
+            # 1. Current funding rate
+            fr_data = self._fetch_endpoint(
+                f"/api/v5/public/funding-rate?instId={inst_id}")
+            if fr_data and fr_data.get("data"):
+                row = fr_data["data"][0]
+                result["funding_rate"] = self._pf(row.get("fundingRate"))
+                result["next_funding_rate"] = self._pf(row.get("nextFundingRate"))
+            else:
+                result["funding_rate"] = None
+
+            # 2. Funding history (for z-score)
+            fh_data = self._fetch_endpoint(
+                f"/api/v5/public/funding-rate-history?instId={inst_id}&limit=100")
+            history_rates: List[float] = []
+            if fh_data and fh_data.get("data"):
+                for row in fh_data["data"]:
+                    r = self._pf(row.get("fundingRate") or row.get("realizedRate"))
+                    if r is not None:
+                        history_rates.append(r)
+            result["history_rates"] = history_rates
+            result["funding_z_score"] = self._compute_z_score(
+                result.get("funding_rate"), history_rates)
+            if history_rates:
+                result["funding_annualized"] = (result.get("funding_rate") or 0) * 3 * 365 * 100
+                # rate_24h_ago: 3 funding periods ago (8h each)
+                if len(history_rates) >= 3:
+                    result["rate_24h_ago"] = history_rates[2]  # data is newest-first
+                else:
+                    result["rate_24h_ago"] = None
+                # 1-sigma of history
+                if len(history_rates) >= self.MIN_HISTORY_FOR_Z:
+                    import statistics
+                    result["rate_1sigma"] = statistics.stdev(history_rates)
+                else:
+                    result["rate_1sigma"] = 0.0001
+            else:
+                result["funding_annualized"] = None
+                result["rate_24h_ago"] = None
+                result["rate_1sigma"] = 0.0001
+
+            # Anomaly flags for backward compat with old FundingRateProvider
+            result["is_anomalous"] = (
+                result.get("funding_z_score") is not None
+                and abs(result["funding_z_score"]) > 3.0
+            )
+            result["is_turning"] = False
+            if result.get("rate_24h_ago") is not None and result.get("funding_rate") is not None:
+                now = result["funding_rate"]
+                prev = result["rate_24h_ago"]
+                if now * prev < 0:  # sign flip
+                    result["is_turning"] = True
+
+            # 3. Open Interest
+            oi_data = self._fetch_endpoint(
+                f"/api/v5/public/open-interest?instType=SWAP&instId={inst_id}")
+            if oi_data and oi_data.get("data"):
+                row = oi_data["data"][0]
+                oi_contracts = self._pf(row.get("oi") or row.get("oiCcy"))
+                result["oi_value"] = oi_contracts if oi_contracts else 0.0
+            else:
+                result["oi_value"] = 0.0
+
+            # 4. Long/Short account ratio
+            ls_acct = self._fetch_endpoint(
+                f"/api/v5/rubik/stat/contracts/long-short-account-ratio"
+                f"?instId={inst_id}&period=1H")
+            if ls_acct and ls_acct.get("data") and ls_acct["data"]:
+                row = ls_acct["data"][0]
+                val = row[1] if isinstance(row, list) and len(row) > 1 else None
+                result["ls_ratio_account"] = self._pf(val)
+            else:
+                result["ls_ratio_account"] = None
+
+            # 5. Long/Short contract ratio
+            ls_cont = self._fetch_endpoint(
+                f"/api/v5/rubik/stat/contracts/long-short-ratio"
+                f"?instId={inst_id}&period=1H")
+            if ls_cont and ls_cont.get("data") and ls_cont["data"]:
+                row = ls_cont["data"][0]
+                val = row[1] if isinstance(row, list) and len(row) > 1 else None
+                result["ls_ratio_contract"] = self._pf(val)
+            else:
+                result["ls_ratio_contract"] = None
+
+            # 6. Taker buy/sell volume
+            taker = self._fetch_endpoint(
+                f"/api/v5/rubik/stat/contracts/taker-volume"
+                f"?instId={inst_id}&period=1H")
+            if taker and taker.get("data") and taker["data"]:
+                row = taker["data"][0]
+                if isinstance(row, list) and len(row) >= 3:
+                    buy = self._pf(row[1]) or 0.0
+                    sell = self._pf(row[2]) or 0.0
+                    total = buy + sell
+                    result["taker_buy_ratio"] = buy / total if total > 0 else 0.5
+                else:
+                    result["taker_buy_ratio"] = 0.5
+            else:
+                result["taker_buy_ratio"] = 0.5
+
+            self._last_error = None
+            return result
+
+        except Exception as exc:
+            self._last_error = str(exc)
+            return f"okx_unavailable:{exc}"
+
+    def _fetch_endpoint(self, path: str) -> Optional[Dict]:
+        url = f"{self.BASE}{path}"
+        return fetch_json(url, timeout=self.request_timeout)
+
+    def _compute_z_score(
+        self, current: Optional[float], history: List[float]
+    ) -> Optional[float]:
+        if current is None or len(history) < self.MIN_HISTORY_FOR_Z:
+            return None
+        import statistics
+        mean = statistics.mean(history)
+        stdev = statistics.stdev(history)
+        if stdev < 1e-12:
+            return 0.0
+        return (current - mean) / stdev
+
+    @staticmethod
+    def _pf(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def describe(self) -> Dict:
+        if self._last_error:
+            return {"status": "degraded", "error": self._last_error, "source": "okx"}
+        return {"status": "enabled", "source": "okx"}
+
+
+class DeribitOptionsProvider:
+    """Deribit options public data — free, no API key required.
+
+    Single endpoint: /api/v2/public/get_book_summary_by_currency
+    Computes max_pain, put_call_ratio, and gamma_cluster signal.
+    """
+
+    BASE = "https://www.deribit.com"
+    # Gamma cluster: OI concentrated at strike within ±2% of spot, expiry < 7 days.
+    GAMMA_STRIKE_PCT = 0.02
+    GAMMA_EXPIRY_DAYS = 7
+    GAMMA_OI_CONCENTRATION = 0.30  # near-ATM OI must be >30% of total to qualify
+
+    def __init__(self, cfg: Optional[Dict] = None):
+        cfg = cfg or {}
+        self.request_timeout = int(cfg.get("request_timeout", 10))
+        self._last_error: Optional[str] = None
+
+    def fetch_symbol_data(self, symbol: str, query_pack: Optional[str] = None) -> Any:
+        _ = query_pack
+        currency = normalize_symbol(symbol).replace("USDT", "").replace("/", "")
+        try:
+            resp = fetch_json(
+                f"{self.BASE}/api/v2/public/get_book_summary_by_currency"
+                f"?currency={currency}&kind=option",
+                timeout=self.request_timeout,
+            )
+            instruments = resp.get("result", []) if isinstance(resp, dict) else []
+            if not instruments:
+                return f"deribit_unavailable:no_data"
+            self._last_error = None
+            return self._process(instruments)
+        except Exception as exc:
+            self._last_error = str(exc)
+            return f"deribit_unavailable:{exc}"
+
+    def _process(self, instruments: List[Dict]) -> Dict:
+        today = dt.date.today()
+        call_oi: Dict[tuple, float] = {}
+        put_oi: Dict[tuple, float] = {}
+        total_call = 0.0
+        total_put = 0.0
+        current_price: Optional[float] = None
+
+        for inst in instruments:
+            name = inst.get("instrument_name", "")
+            parts = name.split("-")
+            if len(parts) < 4:
+                continue
+            try:
+                strike = float(parts[2])
+                opt_type = parts[3]
+                expiry = dt.datetime.strptime(parts[1], "%d%b%y").date()
+            except (ValueError, IndexError):
+                continue
+
+            oi = float(inst.get("open_interest") or 0)
+            if current_price is None:
+                p = inst.get("underlying_price")
+                if p:
+                    current_price = float(p)
+
+            key = (strike, expiry)
+            if opt_type == "C":
+                call_oi[key] = call_oi.get(key, 0.0) + oi
+                total_call += oi
+            elif opt_type == "P":
+                put_oi[key] = put_oi.get(key, 0.0) + oi
+                total_put += oi
+
+        total_oi = total_call + total_put
+        put_call_ratio = (total_put / total_call) if total_call > 0 else None
+
+        # Max pain: strike with highest combined OI (simple proxy)
+        all_keys = set(list(call_oi.keys()) + list(put_oi.keys()))
+        strike_totals: Dict[float, float] = {}
+        for k in all_keys:
+            strike_totals[k[0]] = strike_totals.get(k[0], 0.0) + call_oi.get(k, 0.0) + put_oi.get(k, 0.0)
+        max_pain = max(strike_totals, key=lambda s: strike_totals[s]) if strike_totals else None
+
+        # Gamma cluster detection
+        gamma_cluster = False
+        gamma_strike: Optional[float] = None
+        gamma_expiry_days: Optional[int] = None
+
+        if current_price and current_price > 0 and total_oi > 0:
+            lb = current_price * (1 - self.GAMMA_STRIKE_PCT)
+            ub = current_price * (1 + self.GAMMA_STRIKE_PCT)
+            near_oi = 0.0
+            best_strike: Optional[float] = None
+            best_days: Optional[int] = None
+
+            for k in all_keys:
+                strike, expiry = k
+                days = (expiry - today).days
+                if lb <= strike <= ub and 0 <= days < self.GAMMA_EXPIRY_DAYS:
+                    oi_at_k = call_oi.get(k, 0.0) + put_oi.get(k, 0.0)
+                    if oi_at_k > near_oi:
+                        near_oi = oi_at_k
+                        best_strike = strike
+                        best_days = days
+
+            if near_oi / total_oi > self.GAMMA_OI_CONCENTRATION:
+                gamma_cluster = True
+                gamma_strike = best_strike
+                gamma_expiry_days = best_days
+
+        return {
+            "max_pain": max_pain,
+            "put_call_ratio": put_call_ratio,
+            "gamma_cluster": gamma_cluster,
+            "gamma_strike": gamma_strike,
+            "gamma_expiry_days": gamma_expiry_days,
+        }
+
+    def describe(self) -> Dict:
+        if self._last_error:
+            return {"status": "degraded", "error": self._last_error, "source": "deribit"}
+        return {"status": "enabled", "source": "deribit"}
+
+
+class BitgetFuturesProvider:
+    """Bitget perpetual futures public data — cross-validation fallback for OKX.
+
+    All endpoints are free and require no API key.
+    Base: https://api.bitget.com
+    """
+
+    BASE = "https://api.bitget.com"
+
+    def __init__(self, cfg: Optional[Dict] = None):
+        cfg = cfg or {}
+        self.request_timeout = int(cfg.get("request_timeout", 8))
+        self._last_error: Optional[str] = None
+
+    @staticmethod
+    def _to_bitget_symbol(symbol: str) -> str:
+        base = normalize_symbol(symbol).replace("/USDT", "").replace("USDT", "")
+        return f"{base}USDT"
+
+    def fetch_symbol_data(self, symbol: str, query_pack: Optional[str] = None) -> Any:
+        _ = query_pack
+        sym = self._to_bitget_symbol(symbol)
+        try:
+            fr_resp = fetch_json(
+                f"{self.BASE}/api/v2/mix/market/current-fund-rate"
+                f"?symbol={sym}&productType=USDT-FUTURES",
+                timeout=self.request_timeout,
+            )
+            funding_rate: Optional[float] = None
+            if fr_resp and fr_resp.get("data"):
+                funding_rate = self._pf(fr_resp["data"].get("fundingRate"))
+
+            oi_resp = fetch_json(
+                f"{self.BASE}/api/v2/mix/market/open-interest"
+                f"?symbol={sym}&productType=USDT-FUTURES",
+                timeout=self.request_timeout,
+            )
+            oi_value: Optional[float] = None
+            if oi_resp and oi_resp.get("data"):
+                oi_list = oi_resp["data"].get("openInterestList", [])
+                if oi_list:
+                    oi_value = self._pf(oi_list[0].get("size"))
+
+            self._last_error = None
+            return {
+                "exchange": "bitget",
+                "symbol": sym,
+                "funding_rate": funding_rate,
+                "oi_value": oi_value,
+            }
+        except Exception as exc:
+            self._last_error = str(exc)
+            return f"bitget_unavailable:{exc}"
+
+    @staticmethod
+    def _pf(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def describe(self) -> Dict:
+        if self._last_error:
+            return {"status": "degraded", "error": self._last_error, "source": "bitget"}
+        return {"status": "enabled", "source": "bitget"}
+
+
 @dataclass
 class ProviderBundle:
     coingecko: object
     funding: Optional[object] = None
+    okx_futures: Optional[object] = None
+    bitget_futures: Optional[object] = None
+    deribit_options: Optional[object] = None
 
 
 def load_config(path: Path) -> Dict:
@@ -479,12 +837,18 @@ _QUANT_TOKEN = re.compile(
     r"|\d+\.\d+"                     # 3.4, 0.142 (decimals)
     r"|\d+\s*[KMB]\b"                # 5M, 12 K
 )
+def _sign(x: float) -> int:
+    if x > 0:
+        return 1
+    if x < 0:
+        return -1
+    return 0
 
 
-def _has_quantitative_thesis(text: str) -> bool:
-    if not text:
-        return False
-    return len(_QUANT_TOKEN.findall(text)) >= 2
+def _count_numbers(text: str) -> int:
+    """Count numeric tokens in a string (e.g. '0.142', '3.4', '18')."""
+    import re
+    return len(re.findall(r'\d+\.?\d*', text))
 
 
 def evaluate_asset_policy(
@@ -494,12 +858,17 @@ def evaluate_asset_policy(
     watchlist_symbols: Set[str],
     funding_data: Optional[Dict] = None,
     oi_data: Optional[Dict] = None,
-    counterparty_thesis: str = "",
+    ls_data: Optional[Dict] = None,
+    taker_data: Optional[Dict] = None,
+    deribit_data: Optional[Dict] = None,
+    bitget_data: Optional[Dict] = None,
+    counterparty_thesis: Optional[str] = None,
 ) -> Dict:
     has_watchlist = normalize_symbol(symbol) in watchlist_symbols
     has_market_data = bool(market_data)
     has_market_move = "market-move" in tags
     has_funding_signal = has_meaningful_funding_signal(funding_data)
+    has_funding_turning = funding_data.get('is_turning', False) if isinstance(funding_data, dict) else False
 
     evidence: List[str] = []
     if has_market_data:
@@ -509,19 +878,86 @@ def evaluate_asset_policy(
     if has_funding_signal:
         evidence.append("funding")
 
+    # ── Forced-Flow Primitive Detection ──
+    forced_flow_primitives: List[str] = []
+
+    # P0: Funding Extreme
+    if funding_data and isinstance(funding_data, dict):
+        z = funding_data.get("funding_z_score")
+        if z is not None and abs(z) > 3.0:
+            forced_flow_primitives.append("funding_extreme")
+
+    # P0: OI Divergence
+    if oi_data and isinstance(oi_data, dict):
+        delta_pct = oi_data.get("oi_delta_pct_24h") or oi_data.get("delta_pct", 0)
+        if abs(delta_pct) > 0.05:
+            price_change = (market_data or {}).get("change_24h_pct", 0) or 0
+            if _sign(price_change) != 0 and _sign(price_change) != _sign(delta_pct):
+                forced_flow_primitives.append("oi_divergence")
+
+    # P1: LS Ratio Extreme
+    if ls_data and isinstance(ls_data, dict):
+        acct = ls_data.get("ls_ratio_account")
+        cont = ls_data.get("ls_ratio_contract")
+        if acct is not None and cont is not None:
+            if (acct > 2.0 and cont < 0.8) or (acct < 0.5 and cont > 1.25):
+                forced_flow_primitives.append("ls_ratio_extreme")
+
+    # P1: Funding Flip
+    if funding_data and isinstance(funding_data, dict):
+        now_rate = funding_data.get("funding_rate") or funding_data.get("current_rate", 0)
+        prev_rate = funding_data.get("rate_24h_ago")
+        sigma = funding_data.get("rate_1sigma", 0.0001)
+        if prev_rate is not None and now_rate is not None:
+            if now_rate * prev_rate < 0 and abs(now_rate) > sigma:
+                forced_flow_primitives.append("funding_flip")
+
+    # P1: Taker Flow Imbalance
+    if taker_data and isinstance(taker_data, dict):
+        buy_ratio = taker_data.get("taker_buy_ratio")
+        if buy_ratio is not None and (buy_ratio < 0.3 or buy_ratio > 0.7):
+            forced_flow_primitives.append("taker_flow_imbalance")
+
+    # P2: Options Gamma Cluster (Deribit)
+    if deribit_data and isinstance(deribit_data, dict):
+        if deribit_data.get("gamma_cluster"):
+            forced_flow_primitives.append("options_gamma_cluster")
+
+    # P2: Cross-Exchange Confirm (OKX + Bitget agree on extreme)
+    if (funding_data and isinstance(funding_data, dict)
+            and bitget_data and isinstance(bitget_data, dict)):
+        okx_rate = funding_data.get("funding_rate") or funding_data.get("current_rate", 0)
+        okx_z = funding_data.get("funding_z_score")
+        bitget_rate = bitget_data.get("funding_rate")
+        if (okx_rate is not None and bitget_rate is not None
+                and okx_z is not None and abs(okx_z) > 3.0
+                and _sign(okx_rate) == _sign(bitget_rate)
+                and abs(bitget_rate) > 0.0005):
+            forced_flow_primitives.append("cross_exchange_confirm")
+
+    if forced_flow_primitives:
+        evidence.append("forced_flow")
+
+    # ── Decision Logic ──
     recommended_action = "no_trade"
     crowding_risk = "moderate"
     rationale = ["default_refusal"]
 
-    # investigate is reserved for forced-flow primitives (funding extreme,
-    # OI divergence, liquidation cascade). Funding signal alone → watch only.
     if has_market_move and len(evidence) == 1:
         crowding_risk = "high"
         rationale = ["public_market_move_only"]
+    elif has_watchlist and len(forced_flow_primitives) >= 1:
+        recommended_action = "investigate"
+        crowding_risk = "low"
+        rationale = ["forced_flow_confirmation"]
+    elif has_watchlist and has_funding_turning:
+        recommended_action = "watch"
+        crowding_risk = "moderate"
+        rationale = ["funding_turning_watch"]
     elif has_watchlist and has_funding_signal:
         recommended_action = "watch"
-        crowding_risk = "low"
-        rationale = ["watchlist_funding_signal_watch"]
+        crowding_risk = "moderate"
+        rationale = ["funding_signal_watch"]
     elif has_market_move and len(evidence) <= 2:
         recommended_action = "watch"
         crowding_risk = "elevated"
@@ -533,9 +969,13 @@ def evaluate_asset_policy(
         "evidence_diversity": len(evidence),
         "evidence": evidence,
         "rationale": rationale,
+        "forced_flow_primitives": forced_flow_primitives,
     }
-    if counterparty_thesis:
-        result["thesis_numeric_ok"] = _has_quantitative_thesis(counterparty_thesis)
+
+    # ── Counterparty Thesis Numeric Discipline ──
+    if counterparty_thesis is not None:
+        result["thesis_numeric_ok"] = _count_numbers(counterparty_thesis) >= 2
+
     return result
 
 
@@ -544,6 +984,8 @@ def build_asset_card(
     market_data: Optional[Dict],
     watchlist_symbols: Set[str],
     funding_data: Optional[Dict] = None,
+    okx_data=None,
+    deribit_data=None,
 ) -> Dict:
     symbol = normalize_symbol(symbol)
     tags: List[str] = []
@@ -558,6 +1000,9 @@ def build_asset_card(
     if has_meaningful_funding_signal(funding_data):
         tags.append("funding-signal")
 
+    okx_ok = okx_data and isinstance(okx_data, dict)
+    deribit_ok = deribit_data and isinstance(deribit_data, dict)
+
     providers = {
         "coingecko": {
             "status": "ok" if market_data else "no_data",
@@ -567,6 +1012,14 @@ def build_asset_card(
             "status": "ok" if funding_data else "no_data",
             "data": funding_data or {},
         },
+        "okx": {
+            "status": "ok" if okx_ok else "no_data",
+            "data": okx_data if okx_ok else {},
+        },
+        "deribit": {
+            "status": "ok" if deribit_ok else "no_data",
+            "data": deribit_data if deribit_ok else {},
+        },
     }
     policy = evaluate_asset_policy(
         symbol,
@@ -574,6 +1027,8 @@ def build_asset_card(
         market_data,
         watchlist_symbols,
         funding_data=funding_data,
+        deribit_data=deribit_data if deribit_ok else None,
+        bitget_data=None,
     )
 
     return {
@@ -727,12 +1182,24 @@ def run_intel_cycle(config: Dict, out_dir: Path, provider_bundle: Optional[Provi
             if bundle.funding and symbol in watchlist_symbols
             else None
         )
+        okx_data = (
+            bundle.okx_futures.fetch_symbol_data(symbol)
+            if bundle.okx_futures and symbol in watchlist_symbols
+            else None
+        )
+        deribit_data = (
+            bundle.deribit_options.fetch_symbol_data(symbol)
+            if bundle.deribit_options and symbol in watchlist_symbols
+            else None
+        )
         assets.append(
             build_asset_card(
                 symbol,
                 market_data,
                 watchlist_symbols,
                 funding_data=funding_data,
+                okx_data=okx_data,
+                deribit_data=deribit_data,
             )
         )
 

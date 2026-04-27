@@ -25,6 +25,7 @@ import json
 import math
 import os
 import random
+import re
 import statistics
 import time
 import urllib.parse
@@ -33,6 +34,20 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# Numeric thesis gate: tokens must carry %, $, decimal, or K/M/B unit.
+# Bare integers ("45 cycles") are narrative, not data.
+_THESIS_QUANT = re.compile(
+    r"\$\s*\d+(?:\.\d+)?\s*[KMBkm]?"
+    r"|\d+(?:\.\d+)?\s*%"
+    r"|\d+\.\d+"
+    r"|\d+\s*[KMBkm]\b"
+)
+
+
+def _thesis_has_quant(text: str) -> bool:
+    """True when counterparty_thesis contains ≥2 numeric data tokens."""
+    return len(_THESIS_QUANT.findall(text)) >= 2
 
 
 # =========================
@@ -690,6 +705,44 @@ class IntelBridge:
                     return funding_provider.get("data")
         return None
 
+    def get_okx_data(self, symbol: str) -> Optional[Dict]:
+        """Return OKX futures data for symbol (funding_z_score, ls_ratio, taker_flow, oi)."""
+        rpt_path = self._find_latest_report()
+        if rpt_path is None:
+            return None
+        try:
+            report: Dict = json.loads(rpt_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if self._is_stale(report.get("run", {}).get("started_at", "")):
+            return None
+        base_symbol = symbol.split("/")[0].upper()
+        for asset in report.get("assets", []):
+            if asset.get("symbol", "").upper() == base_symbol:
+                prov = asset.get("providers", {}).get("okx", {})
+                if prov.get("status") == "ok":
+                    return prov.get("data")
+        return None
+
+    def get_deribit_data(self, symbol: str) -> Optional[Dict]:
+        """Return Deribit options data for symbol (gamma_cluster, max_pain, put_call_ratio)."""
+        rpt_path = self._find_latest_report()
+        if rpt_path is None:
+            return None
+        try:
+            report: Dict = json.loads(rpt_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if self._is_stale(report.get("run", {}).get("started_at", "")):
+            return None
+        base_symbol = symbol.split("/")[0].upper()
+        for asset in report.get("assets", []):
+            if asset.get("symbol", "").upper() == base_symbol:
+                prov = asset.get("providers", {}).get("deribit", {})
+                if prov.get("status") == "ok":
+                    return prov.get("data")
+        return None
+
 
 # =========================
 # Agents (simple deterministic heuristics)
@@ -778,21 +831,31 @@ class SupportResistanceAgent(Agent):
 class RiskAgent(Agent):
     """Risk-as-viscosity: high vol => HOLD (friction). Normal vol => follow trend (flow).
 
-    Previous design always returned HOLD, making 4/5 agreement impossible.
-    Now acts as a confirming signal when conditions are safe.
+    Options gamma cluster veto (primary check): active pin at nearby strike within 7 days
+    triggers high-confidence HOLD — gamma dealers will suppress directional moves.
     """
     name = "RiskAgent"
-    def __init__(self, vol_lookback: int = 30):
+
+    def __init__(self, vol_lookback: int = 30, intel_bridge: Optional["IntelBridge"] = None):
         self.vol_lookback = vol_lookback
+        self.intel_bridge = intel_bridge
+
     def decide(self, snap: MarketSnapshot) -> Verdict:
+        # Gamma cluster veto: options market will suppress directional moves
+        if self.intel_bridge is not None:
+            deribit = getattr(self.intel_bridge, "get_deribit_data", lambda _: None)(snap.symbol)
+            if deribit and isinstance(deribit, dict) and deribit.get("gamma_cluster"):
+                strike = deribit.get("gamma_strike", "?")
+                expiry = deribit.get("gamma_expiry_days", "?")
+                return Verdict(self.name, Action.HOLD, 0.88,
+                               f"Gamma cluster at {strike} expires in {expiry}d — pin risk")
+
         closes = [c for (_, _, _, _, c, _) in snap.ohlcv]
         v = realized_vol_from_closes(closes[-self.vol_lookback:])
         vol_score = v * math.sqrt(60)
         if vol_score > 0.03:
-            # High vol = viscosity: friction against new positions
             conf = min(0.95, 0.75 + (vol_score - 0.03) * 5)
             return Verdict(self.name, Action.HOLD, conf, f"High realized vol ({vol_score:.3f}) => reduce action")
-        # Normal vol = flow: follow the short-term trend direction
         fast = ema(closes[-40:], 5)
         slow = ema(closes[-40:], 15)
         if fast > slow:
@@ -806,12 +869,14 @@ class RiskAgent(Agent):
 
 
 class LiquidationPressureAgent(Agent):
-    """Reads funding rate / OI from IntelBridge to identify forced sellers.
+    """Liquidation pressure via OKX ls_ratio_extreme + taker_flow_imbalance.
 
-    This agent looks at market microstructure, not price charts:
-    - Extreme positive funding → longs are crowded → short (wait for liquidation cascade)
-    - Extreme negative funding → shorts are crowded → long (wait for short squeeze)
-    - Funding turning → someone is switching sides → follow the new direction
+    OKX path (primary):
+    - ls_ratio_account > 2.0 AND contract < 0.8: retail crowded long, pros short → SHORT
+    - ls_ratio_account < 0.5 AND contract > 1.25: retail crowded short, pros long → LONG
+    - taker_buy_ratio < 0.3: 70%+ active sellers → SHORT
+    - taker_buy_ratio > 0.7: 70%+ active buyers → LONG
+    Legacy path (fallback): funding rate extremes from get_funding().
     """
     name = "LiquidationPressureAgent"
 
@@ -822,7 +887,64 @@ class LiquidationPressureAgent(Agent):
         if self.intel_bridge is None:
             return Verdict(self.name, Action.HOLD, 0.40, "No intel bridge")
 
+        okx = getattr(self.intel_bridge, "get_okx_data", lambda _: None)(snap.symbol)
+        if okx and isinstance(okx, dict):
+            return self._decide_okx(okx)
+
         funding = self.intel_bridge.get_funding(snap.symbol)
+        return self._decide_legacy(funding)
+
+    def _decide_okx(self, okx: Dict) -> Verdict:
+        ls_acct = okx.get("ls_ratio_account") or 0.0
+        ls_cont = okx.get("ls_ratio_contract") or 0.0
+        taker_buy = okx.get("taker_buy_ratio") or 0.5
+        oi = okx.get("oi_value", 0) or 0
+        oi_str = f"${oi/1e9:.1f}B" if oi > 0 else "unknown"
+
+        # ls_ratio_extreme: retail crowded long, professional money net short
+        if ls_acct > 2.0 and ls_cont < 0.8:
+            thesis = (f"L/S account ratio={ls_acct:.1f}x — retail 2x+ net long. "
+                      f"Contract ratio={ls_cont:.2f}x: smart money net short. "
+                      f"OI={oi_str}. Retail crowd faces {ls_acct:.1f}σ liquidation cascade.")
+            conf = min(0.85, 0.65 + (ls_acct - 2.0) * 0.08)
+            return Verdict(self.name, Action.SHORT, conf,
+                           f"LS extreme: acct={ls_acct:.1f} cont={ls_cont:.2f}",
+                           counterparty_thesis=thesis)
+
+        # ls_ratio_extreme: retail crowded short, professional money net long
+        if ls_acct < 0.5 and ls_cont > 1.25:
+            thesis = (f"L/S account ratio={ls_acct:.2f}x — retail 2x+ net short. "
+                      f"Contract ratio={ls_cont:.2f}x: smart money net long. "
+                      f"OI={oi_str}. Crowded shorts face squeeze event.")
+            conf = min(0.85, 0.65 + (0.5 - ls_acct) * 0.08)
+            return Verdict(self.name, Action.LONG, conf,
+                           f"LS extreme: acct={ls_acct:.2f} cont={ls_cont:.2f}",
+                           counterparty_thesis=thesis)
+
+        # taker_flow_imbalance: aggressive sellers dominating
+        if taker_buy < 0.3:
+            sell_pct = (1.0 - taker_buy) * 100
+            thesis = (f"Taker buy ratio={taker_buy:.2f} — {sell_pct:.0f}% active selling. "
+                      f"Aggressive sell flow sustained. OI={oi_str}. "
+                      f"Market-order sellers absorbing bids at {sell_pct:.0f}% vs 30% threshold.")
+            return Verdict(self.name, Action.SHORT, 0.72,
+                           f"Taker flow imbalance: buy={taker_buy:.2f}",
+                           counterparty_thesis=thesis)
+
+        # taker_flow_imbalance: aggressive buyers dominating
+        if taker_buy > 0.7:
+            buy_pct = taker_buy * 100
+            thesis = (f"Taker buy ratio={taker_buy:.2f} — {buy_pct:.0f}% active buying. "
+                      f"Aggressive buy flow sustained. OI={oi_str}. "
+                      f"Market-order buyers absorbing asks at {buy_pct:.0f}% vs 70% threshold.")
+            return Verdict(self.name, Action.LONG, 0.72,
+                           f"Taker flow imbalance: buy={taker_buy:.2f}",
+                           counterparty_thesis=thesis)
+
+        return Verdict(self.name, Action.HOLD, 0.45,
+                       f"Balanced: ls_acct={ls_acct:.2f} taker_buy={taker_buy:.2f}")
+
+    def _decide_legacy(self, funding) -> Verdict:
         if funding is None:
             return Verdict(self.name, Action.HOLD, 0.40, "No funding data available")
 
@@ -837,7 +959,6 @@ class LiquidationPressureAgent(Agent):
         basis_str = f"{basis:.2f}%" if basis is not None else "N/A"
         rate_pct = rate * 100
 
-        # Extreme positive funding: longs pay, longs crowded → fade them
         if rate > 0.0005 and is_anomalous:
             thesis = (f"Longs paying {rate_pct:.3f}%/8h on {exchange}. "
                       f"OI={oi_str}, basis={basis_str}. "
@@ -847,7 +968,6 @@ class LiquidationPressureAgent(Agent):
                            f"Extreme +funding ({rate_pct:.3f}%): longs crowded",
                            counterparty_thesis=thesis)
 
-        # Extreme negative funding: shorts pay, shorts crowded → fade them
         if rate < -0.0005 and is_anomalous:
             thesis = (f"Shorts paying {abs(rate_pct):.3f}%/8h on {exchange}. "
                       f"OI={oi_str}, basis={basis_str}. "
@@ -857,7 +977,6 @@ class LiquidationPressureAgent(Agent):
                            f"Extreme -funding ({rate_pct:.3f}%): shorts crowded",
                            counterparty_thesis=thesis)
 
-        # Funding turning direction: someone switching sides
         if is_turning:
             if rate > 0:
                 thesis = f"Funding turning positive ({rate_pct:.3f}%). Previous shorts being squeezed. OI={oi_str}."
@@ -875,13 +994,10 @@ class LiquidationPressureAgent(Agent):
 
 
 class FundingFlowAgent(Agent):
-    """Orthogonal to TrendAgent: looks at funding rate direction, not price.
+    """Capital-flow signal using OKX z-score and funding_flip primitives.
 
-    Replaces ContrarianAgent which was just TrendAgent inverted (= noise).
-    This agent provides genuinely different information:
-    - TrendAgent sees price momentum
-    - FundingFlowAgent sees capital flow momentum
-    Together = binocular vision.
+    OKX path (primary): funding_extreme (|z| > 3.0) + funding_flip (sign reversal > 1σ).
+    Legacy path (fallback): moderate rate direction from get_funding().
     """
     name = "FundingFlowAgent"
 
@@ -892,33 +1008,188 @@ class FundingFlowAgent(Agent):
         if self.intel_bridge is None:
             return Verdict(self.name, Action.HOLD, 0.40, "No intel bridge")
 
+        okx = getattr(self.intel_bridge, "get_okx_data", lambda _: None)(snap.symbol)
+        if okx and isinstance(okx, dict):
+            return self._decide_okx(okx)
+
+        # Legacy fallback: CoinGecko-derived funding rate
         funding = self.intel_bridge.get_funding(snap.symbol)
         if funding is None:
             return Verdict(self.name, Action.HOLD, 0.40, "No funding data")
+        return self._decide_legacy(funding)
 
+    def _decide_okx(self, okx: Dict) -> Verdict:
+        rate = okx.get("funding_rate", 0) or 0
+        z = okx.get("funding_z_score")
+        prev = okx.get("rate_24h_ago")
+        sigma = okx.get("rate_1sigma", 0.0001) or 0.0001
+        rate_pct = rate * 100
+
+        # P0: Funding Extreme
+        if z is not None and z > 3.0:
+            thesis = (f"Funding z={z:.1f}σ — longs paying {rate_pct:.3f}%/8h. "
+                      f"30d extreme overextension. Overleveraged longs face {z:.1f}σ liquidation event.")
+            return Verdict(self.name, Action.SHORT, min(0.85, 0.65 + (z - 3.0) * 0.05),
+                           f"Extreme +funding z={z:.1f}σ",
+                           counterparty_thesis=thesis)
+        if z is not None and z < -3.0:
+            thesis = (f"Funding z={z:.1f}σ — shorts paying {abs(rate_pct):.3f}%/8h. "
+                      f"30d extreme underextension. Overleveraged shorts face {abs(z):.1f}σ squeeze.")
+            return Verdict(self.name, Action.LONG, min(0.85, 0.65 + (abs(z) - 3.0) * 0.05),
+                           f"Extreme -funding z={z:.1f}σ",
+                           counterparty_thesis=thesis)
+
+        # P1: Funding Flip
+        if prev is not None and rate * prev < 0 and abs(rate) > sigma:
+            if rate > 0:
+                thesis = (f"Funding flipped +{rate_pct:.3f}%/8h from {prev*100:.3f}%. "
+                          f"Sign reversal above {sigma*100:.4f}% 1σ — shorts squeezed out.")
+                return Verdict(self.name, Action.LONG, 0.65,
+                               f"Funding flip +{rate_pct:.3f}%",
+                               counterparty_thesis=thesis)
+            else:
+                thesis = (f"Funding flipped {rate_pct:.3f}%/8h from +{prev*100:.3f}%. "
+                          f"Sign reversal above {sigma*100:.4f}% 1σ — longs being flushed.")
+                return Verdict(self.name, Action.SHORT, 0.65,
+                               f"Funding flip {rate_pct:.3f}%",
+                               counterparty_thesis=thesis)
+
+        # Moderate flow
+        if 0.0001 < rate <= 0.0005:
+            thesis = (f"Moderate long flow: funding +{rate_pct:.3f}% (z={z or 0.0:.1f}σ). "
+                      f"Longs paying premium below extreme threshold.")
+            return Verdict(self.name, Action.LONG, 0.58,
+                           f"Positive OKX flow ({rate_pct:.3f}%)",
+                           counterparty_thesis=thesis)
+        if -0.0005 <= rate < -0.0001:
+            thesis = (f"Moderate short flow: funding {rate_pct:.3f}% (z={z or 0.0:.1f}σ). "
+                      f"Shorts paying premium below extreme threshold.")
+            return Verdict(self.name, Action.SHORT, 0.58,
+                           f"Negative OKX flow ({rate_pct:.3f}%)",
+                           counterparty_thesis=thesis)
+
+        return Verdict(self.name, Action.HOLD, 0.45,
+                       f"Funding flat ({rate_pct:.3f}%), no flow signal")
+
+    def _decide_legacy(self, funding: Dict) -> Verdict:
         rate = funding.get("current_rate", 0) or 0
         oi = funding.get("open_interest")
-        basis = funding.get("basis", 0) or 0
         rate_pct = rate * 100
         oi_str = f"${oi/1e9:.1f}B" if oi and oi > 0 else "?"
-
-        # Moderate positive funding = capital flowing into longs = bullish flow
         if 0.0001 < rate <= 0.0005:
             thesis = f"Moderate long flow: funding +{rate_pct:.3f}%, OI={oi_str}. Shorts paying less = healthy positioning."
             return Verdict(self.name, Action.LONG, 0.58,
-                           f"Positive funding flow ({rate_pct:.3f}%)",
-                           counterparty_thesis=thesis)
-
-        # Moderate negative funding = capital flowing into shorts = bearish flow
+                           f"Positive funding flow ({rate_pct:.3f}%)", counterparty_thesis=thesis)
         if -0.0005 <= rate < -0.0001:
             thesis = f"Moderate short flow: funding {rate_pct:.3f}%, OI={oi_str}. Longs paying less = healthy positioning."
             return Verdict(self.name, Action.SHORT, 0.58,
-                           f"Negative funding flow ({rate_pct:.3f}%)",
-                           counterparty_thesis=thesis)
-
-        # Extreme rates handled by LiquidationPressureAgent, not us
+                           f"Negative funding flow ({rate_pct:.3f}%)", counterparty_thesis=thesis)
         return Verdict(self.name, Action.HOLD, 0.45,
                        f"Funding flat ({rate_pct:.3f}%), no clear flow")
+
+
+class OIFlowAgent(Agent):
+    """OI divergence signal: price/OI directional conflict reveals smart-money accumulation or distribution.
+
+    price up + OI down → distribution (longs exiting into rally) → SHORT
+    price down + OI up → accumulation (fresh longs absorbing dip) → LONG
+    Threshold: |oi_delta_pct_24h| > 5% to filter noise.
+    """
+    name = "OIFlowAgent"
+
+    def __init__(self, intel_bridge: Optional["IntelBridge"] = None):
+        self.intel_bridge = intel_bridge
+
+    def decide(self, snap: MarketSnapshot) -> Verdict:
+        if self.intel_bridge is None:
+            return Verdict(self.name, Action.HOLD, 0.40, "No intel bridge")
+
+        okx = getattr(self.intel_bridge, "get_okx_data", lambda _: None)(snap.symbol)
+        if not okx or not isinstance(okx, dict):
+            return Verdict(self.name, Action.HOLD, 0.40, "No OKX data")
+
+        oi_delta = okx.get("oi_delta_pct_24h")
+        if oi_delta is None or abs(oi_delta) < 0.05:
+            return Verdict(self.name, Action.HOLD, 0.45,
+                           f"OI delta {oi_delta:.1%} below threshold" if oi_delta is not None else "OI delta unavailable")
+
+        closes = [c for (_, _, _, _, c, _) in snap.ohlcv]
+        price_dir = 1 if closes[-1] > closes[0] else -1 if closes[-1] < closes[0] else 0
+        oi_dir = 1 if oi_delta > 0 else -1
+
+        oi_val = okx.get("oi_value", 0) or 0
+        oi_str = f"${oi_val/1e9:.1f}B" if oi_val > 0 else "unknown"
+        oi_pct = oi_delta * 100
+
+        if price_dir > 0 and oi_dir < 0:
+            thesis = (f"Price +{(closes[-1]-closes[0])/closes[0]*100:.1f}% while OI {oi_pct:.1f}%. "
+                      f"OI={oi_str}. Long exits into rally = distribution. "
+                      f"Participants closing {abs(oi_pct):.1f}% of positions at peak.")
+            return Verdict(self.name, Action.SHORT, 0.72,
+                           f"OI divergence: price↑ OI{oi_pct:.1f}%",
+                           counterparty_thesis=thesis)
+
+        if price_dir < 0 and oi_dir > 0:
+            thesis = (f"Price -{abs((closes[-1]-closes[0])/closes[0]*100):.1f}% while OI +{oi_pct:.1f}%. "
+                      f"OI={oi_str}. New longs absorbing dip = accumulation. "
+                      f"+{oi_pct:.1f}% OI added at lower prices signals conviction.")
+            return Verdict(self.name, Action.LONG, 0.72,
+                           f"OI divergence: price↓ OI+{oi_pct:.1f}%",
+                           counterparty_thesis=thesis)
+
+        return Verdict(self.name, Action.HOLD, 0.45,
+                       f"OI aligned with price — no divergence signal")
+
+
+class OptionsGammaAgent(Agent):
+    """Max pain gravity: gamma dealers hedge to pin price near max pain expiry.
+
+    Active gamma cluster + price below max_pain → buy pressure → LONG
+    Active gamma cluster + price above max_pain → sell pressure → SHORT
+    No cluster or no data → HOLD.
+    """
+    name = "OptionsGammaAgent"
+
+    def __init__(self, intel_bridge: Optional["IntelBridge"] = None):
+        self.intel_bridge = intel_bridge
+
+    def decide(self, snap: MarketSnapshot) -> Verdict:
+        if self.intel_bridge is None:
+            return Verdict(self.name, Action.HOLD, 0.40, "No intel bridge")
+
+        deribit = getattr(self.intel_bridge, "get_deribit_data", lambda _: None)(snap.symbol)
+        if not deribit or not isinstance(deribit, dict):
+            return Verdict(self.name, Action.HOLD, 0.40, "No Deribit data")
+
+        if not deribit.get("gamma_cluster"):
+            return Verdict(self.name, Action.HOLD, 0.45, "No active gamma cluster")
+
+        max_pain = deribit.get("max_pain")
+        strike = deribit.get("gamma_strike")
+        expiry_days = deribit.get("gamma_expiry_days", "?")
+        pcr = deribit.get("put_call_ratio", 0)
+        price = snap.price
+
+        if max_pain is None:
+            return Verdict(self.name, Action.HOLD, 0.45, "Gamma cluster active but max_pain unavailable")
+
+        if price < max_pain:
+            thesis = (f"Max pain ${max_pain:,.0f} above spot ${price:,.0f}. "
+                      f"Gamma cluster at ${strike:,}, {expiry_days}d expiry. "
+                      f"PCR={pcr:.2f}. Dealers buy delta to pin — ${max_pain-price:,.0f} magnetic pull.")
+            return Verdict(self.name, Action.LONG, 0.68,
+                           f"Below max_pain {max_pain:.0f} by {max_pain-price:.0f}",
+                           counterparty_thesis=thesis)
+
+        if price > max_pain:
+            thesis = (f"Max pain ${max_pain:,.0f} below spot ${price:,.0f}. "
+                      f"Gamma cluster at ${strike:,}, {expiry_days}d expiry. "
+                      f"PCR={pcr:.2f}. Dealers sell delta to pin — ${price-max_pain:,.0f} downward gravity.")
+            return Verdict(self.name, Action.SHORT, 0.68,
+                           f"Above max_pain {max_pain:.0f} by {price-max_pain:.0f}",
+                           counterparty_thesis=thesis)
+
+        return Verdict(self.name, Action.HOLD, 0.50, "Price at max_pain — no net gamma pressure")
 
 
 # =========================
@@ -932,11 +1203,13 @@ class JudgeAgent:
     def __init__(self, min_agents_agree: int = 4):
         self.min_agents_agree = min_agents_agree
         self.weights = {
-            "TrendAgent": 1.0,
+            "TrendAgent": 0.5,
             "SupportResistanceAgent": 1.0,
             "RiskAgent": 0.5,
-            "LiquidationPressureAgent": 1.2,  # highest weight: microstructure > chart patterns
+            "LiquidationPressureAgent": 1.2,
             "FundingFlowAgent": 0.8,
+            "OIFlowAgent": 0.9,
+            "OptionsGammaAgent": 0.7,
         }
 
     def aggregate(self, verdicts: List[Verdict]) -> Consensus:
@@ -1051,6 +1324,8 @@ class PhilosophyGuardian:
         # "一切优势都会腐烂" — No trade without a counterparty thesis
         if not plan.counterparty_thesis.strip():
             reasons.append("NO_COUNTERPARTY_THESIS: cannot trade without knowing who loses")
+        elif not _thesis_has_quant(plan.counterparty_thesis):
+            reasons.append("WEAK_THESIS: counterparty thesis must contain ≥2 numeric data points")
         return (len(reasons) == 0), reasons
 
 
@@ -1745,9 +2020,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     agents: List[Agent] = [
         TrendAgent(),
         SupportResistanceAgent(),
-        RiskAgent(vol_lookback=risk.vol_lookback),
+        RiskAgent(vol_lookback=risk.vol_lookback, intel_bridge=intel_bridge),
         LiquidationPressureAgent(intel_bridge=intel_bridge),
         FundingFlowAgent(intel_bridge=intel_bridge),
+        OIFlowAgent(intel_bridge=intel_bridge),
+        OptionsGammaAgent(intel_bridge=intel_bridge),
     ]
 
     judge = JudgeAgent(min_agents_agree=cfg.min_agents_agree)
