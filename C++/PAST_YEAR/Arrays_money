@@ -1,0 +1,43 @@
+#include <iostream>
+using namespace std;
+
+
+
+int main(){
+    int test_case;
+    const double tax = 1.08;
+    double total_amount[100] = {0},
+           total_expense[100] = {0},
+           value;
+
+
+            cout << "How many sets of data? --> ";
+            cin >> test_case;
+            cout << "Input" << endl ;
+
+  for (int i = 0; i < test_case; i++){
+    cout <<"Enter the money you have"; 
+    cin >> total_amount[i];
+
+    cout << "Enter the price of all the items: ";
+    cin >> value;
+
+    while (value != -1){
+        total_expense[i] += value;
+        cin >> value;
+    }
+        total_expense[i] *= tax;
+  }
+
+  cout << "Output" << endl ;
+  for (int i = 0 ; i < test_case ; i++){
+        double diff = total_amount[i] - total_expense[i];
+
+        if (diff < 0)
+            cout << "RM " << diff << "SHORT" << endl;
+        else 
+            cout <<"ENOUGH MONEY" << endl;
+
+  }
+    return 0;
+}
