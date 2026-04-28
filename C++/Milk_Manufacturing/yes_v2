@@ -1,0 +1,19 @@
+// Calculations
+       double calcProfit(double ton_x){
+            double total_num_bottle;
+            double margin;
+            double total_cost;
+            double total_revenue;
+            double total_profit;
+            
+        double ton_to_liter = 1000.00,
+               bottle_volume = 0.5,
+               wholesale_price = 4.80,
+               cost_per_bottle = 3.20;
+
+        total_num_bottle = (x_ton * ton_to_liter) / bottle_volume;
+        margin = wholesale_price - cost_per_bottle;
+        total_cost = total_num_bottle * cost_per_bottle;
+        total_revenue = total_num_bottle * wholesale_price;
+        total_profit = total_num_bottle * margin;
+    } 

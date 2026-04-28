@@ -1,0 +1,68 @@
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <iomanip>
+#include <limits>
+#include "yes.h"
+
+using namespace std;
+
+int main (){
+    int received = -1 ;
+    int n;
+    int x_ton_Array[n];
+    
+    double x_ton;
+    bool detection = true;
+    do{
+            if (detection){
+            cout << "Detecting raw material[";
+            for (int i = 1; i <= 6; i ++){
+                cout << "#" << flush;
+                this_thread :: sleep_for(chrono ::seconds(1));
+            }
+            cout << "]" << endl;
+            detection = false;
+            }
+
+        cout << "Raw material received? (1 = Yes, 0 = No): ";
+        if(!(cin >> received)){
+            cout << "Invalid choice , please enter 0 or 1" << endl;
+            cin.clear();                          
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');  
+            received = -1;
+            detection = false;  
+            continue;
+        }
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');  
+        
+       
+        if (received == 1){
+            cout << endl << "System is now running" << endl
+                 << "How many batch milk received ? ";
+            cin >> n;
+
+            cout << "What is the volume of raw material? : ";
+            cin >> x_ton;
+
+            MilkProcessor processor;
+            processor.processRawMaterial(x_ton);
+            
+            return 0;
+        }
+
+        if (received == 0){
+            cout << "No raw material yet, checking again" << endl;
+            detection = true;
+            continue;
+        }
+
+        cout << "Invalid choice , please enter 0 or 1"; 
+        received = -1;
+        detection = false;
+
+    }while (received != 1 );
+
+    cout << "Raw material is calculating" << endl;
+    return 0;
+}
