@@ -1,0 +1,17 @@
+#include <iostream>
+using namespace std;
+
+int main(){
+    int number;
+    cout << "Enter an integer: ";
+    cin >> number;
+
+    {
+    if ( number % 6 == 0 )
+        cout << "The number " << number << " is multiple of 6";
+    else 
+        cout << "The number " << number << " is not multiple of 6";
+    }
+        return 0;
+
+}

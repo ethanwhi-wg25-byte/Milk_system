@@ -1,0 +1,56 @@
+#include <iostream>
+#include <iomanip>
+using namespace std;
+
+int main(){
+    double purchase, tax_amount ,final_amount ;
+    int tax_code;
+
+    cout <<"Enter your purchase amount: Rm";
+
+    if(!(cin >> purchase)){
+        cout << " Invalid Input";
+        return 0;
+}
+
+    cout <<"Enter your tax code: ";
+
+    while (!(cin >> tax_code )|| (tax_code == 0 || tax_code == 3 || tax_code == 5 || tax_code == 2)){
+        cout << "Invalid Input\n";
+        cin >> tax_code;
+}
+    switch (tax_code)
+    {
+        case 0:
+            tax_amount = purchase * 0;
+        break;
+
+        case 3:
+            tax_amount = purchase * 0.03;
+        break;
+
+        case 5:
+            tax_amount = purchase * 0.05;
+        break;
+
+        case 2:
+            tax_amount = purchase * 0.07;
+        break;
+
+    default:
+        cout << "Invalid Tax Code";
+    }
+
+    final_amount = purchase - tax_amount;
+    cout << left 
+         << setw(21) << "Purchase amount" 
+         << setw(25) << "Tax exemption amount " 
+         << setw(20) << "Final amount due\n";
+
+    cout << fixed << setprecision(2)
+         << "Rm" << setw(18) << purchase << "   "
+         << "Rm" << setw(20) << tax_amount << "   "
+         << "Rm" << setw(18) << final_amount << "\n";
+
+        return 0;
+}

@@ -8,30 +8,29 @@
 
 using namespace std;
 
+
+double calcProfit(double x_ton);
+
+
+
 class MilkProcessor {
-private:
+private:    
+    int n = 0; // number of batches
+    const double ton_to_liter = 1000.0;
+    const double bottle_volume = 0.5;
+    const double wholesale_price = 4.80;
+    const double cost_per_bottle = 3.20;
+
     double total_num_bottle;
     double margin;
     double total_cost;
     double total_revenue;
     double total_profit;
     
-    const double ton_to_liter = 1000.0;
-    const double bottle_volume = 0.5;
-    const double wholesale_price = 4.80;
-    const double cost_per_bottle = 3.20;
 
 public:
     MilkProcessor() {}
-    
     void processRawMaterial(double x_ton) {
-        cout << "Analyzing ";
-        for (int i = 1; i <= 3; i++) {
-            cout << "#" << flush;
-            this_thread::sleep_for(chrono::seconds(1));
-        }
-        cout << endl;
-        
         // Calculations
         total_num_bottle = (x_ton * ton_to_liter) / bottle_volume;
         margin = wholesale_price - cost_per_bottle;
@@ -45,6 +44,7 @@ public:
     
 private:
     void displayResults() {
+        for (int i = 0; i < n; i++) {}
         cout << fixed << setprecision(2) << endl 
              << "+------------------------------+-----------+" << endl 
              << "|" << left << setw(30) << "Item" << "|" << right << setw(11) << "Amount" << "|" << endl
@@ -58,3 +58,4 @@ private:
 };
 
 #endif
+

@@ -1,0 +1,54 @@
+#include <iostream>
+#include <iomanip>
+using namespace std;
+
+int main (){
+    double regularP, overtimeP, GrossP, payrate;
+    int hours;
+
+    const double normal_hours = 40;
+    const double overpayrate = 1.5 ;
+
+    cout << "Enter the numbers of hours worked this week: ";
+    if(!(cin >> hours)){
+        cout << "WRONG\n";
+        return 0;
+    }
+
+    cout << "Enter the pay rate: ";
+    if(!(cin >> payrate)) {
+        cout << "WRONG\n";
+        return 0;
+    }
+
+    if (hours <0 || payrate <0){
+        cout <<"WRONG\n";
+        return 0;
+    }
+    else{
+        if (hours > normal_hours)
+        {
+            regularP = hours * payrate;
+            overtimeP = (hours - normal_hours) * 1.5 * payrate;
+        }
+        else
+        {
+            regularP = hours * payrate;
+            overtimeP = 0;
+        }
+
+        GrossP = regularP + overtimeP;
+    
+        cout << fixed << setprecision(2);
+        cout << endl 
+             << setw(18) << "REGULAR PAY" 
+             << setw(18) << "OVERTIME PAY" 
+             << setw(16) << "GROSS PAY" << endl;
+
+        cout <<setw(16)  << regularP 
+             <<setw(16)  << overtimeP 
+             <<setw(19)  << GrossP << "\n";
+    }
+
+   return 0;
+}

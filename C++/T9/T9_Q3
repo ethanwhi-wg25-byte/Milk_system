@@ -1,0 +1,21 @@
+#include <iostream>
+
+using namespace std;
+
+double Min (double, double, double);
+
+int main (){
+
+}
+
+cout << "Enter a number";
+
+
+
+double Min (double a , double b, double c){
+double min = a;
+    if (b < min)
+        min = b;
+    if (c < min)
+        min = c
+}

@@ -1,0 +1,19 @@
+#include <iostream>
+#include <iomanip>
+using namespace std;
+
+int main(){
+    const int feet_1 = 12;
+    int total_inches;
+
+    cout << "Please enter your total height in inches ";
+    cin >> total_inches;
+
+    int feet = total_inches / feet_1;
+    int inches = total_inches % feet_1;
+
+    cout << "your height is " << feet << " feet and " << inches <<" inches ";
+
+    return 0;
+
+}

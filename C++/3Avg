@@ -1,0 +1,22 @@
+#include <iostream>
+using namespace std;
+
+int main() {
+    int n1, n2, n3;
+    float average;
+
+    cout << "Enter the first number: ";
+    cin >> n1;
+
+    cout << "Enter the second number: ";
+    cin >> n2;
+
+    cout << "Enter the third number: ";
+    cin >> n3;
+
+    average = (n1 + n2 + n3) / 3.0;             // the 0.0 ensures that the division is done in floating point
+
+    cout << "The average of " << n1 << ", " << n2 << ", and " << n3 << " is: " << average << endl;
+
+    return 0;
+}

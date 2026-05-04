@@ -1,0 +1,67 @@
+#include <iostream>
+#include <iomanip>
+using namespace std;
+
+int main(){
+    const double PriceA_100 = 2.50;
+    const double PriceB_100 = 3.15;
+
+    int customerCount = 0;
+    double totalPoundsA = 0.0, 
+           totalPoundsB = 0.0,
+           totalReceipts = 0.0;
+
+    while (true){
+        double poundsA, poundsB;
+
+        cout << "Enter Feed A pounds ";
+        cin  >> poundsA;
+
+        cout << "Enter Feed B punds ";
+        cin >> poundsB;
+
+        if (poundsA == 0.00 && poundsB == 0.00){
+          break;
+        }
+        if (poundsA < 0.0 || poundsB < 0.0){
+            cout << "Invalid output. Pounds cannot be negative\n";
+            continue;
+
+        }
+
+        double costA =(poundsA / 100.0) * PriceA_100 , 
+               costB =(poundsB / 100.0) * PriceB_100,
+               orderTotal =costA + costB;
+
+        customerCount++;
+        totalPoundsA += poundsA;
+        totalPoundsB += poundsB;
+        totalReceipts += orderTotal;
+
+        cout << fixed << setprecision(2)
+             << "\nFeed A: " << poundsA << "lb\n";
+
+        cout << fixed << setprecision(2)
+             << "Cost: Rm " << costA ;
+        
+        cout << fixed << setprecision(2)
+             << "\nFeed B: " << poundsB << "lb\n";
+
+        cout << fixed << setprecision(2)
+             << "Cost: RM" << costB << "\n"
+             << "Order total: Rm" << orderTotal << "\n";
+}
+
+cout << "\nSummary" << "Customer processed: " 
+     << customerCount ;
+
+cout << fixed << setprecision(2) 
+     << "\nTotal feed A ordered: " << totalPoundsA << "lb"
+     << "\nTotal feed B ordered: " << totalPoundsB << "lb"
+     << "\nTotal receipts: Rm" << totalReceipts ;
+
+    return 0;
+}
+
+     
+    

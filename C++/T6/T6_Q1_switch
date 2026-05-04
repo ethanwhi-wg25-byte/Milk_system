@@ -1,0 +1,25 @@
+#include <iostream>
+using namespace std;
+
+int main (){
+    char gender;
+    cout << "Please enter your gender(M/F) : ";
+    cin >> gender;
+
+    switch (gender)
+    {
+        case 'M':
+        case 'm':
+            cout << "You are a Male\n";
+        break;
+
+        case 'F':
+        case 'f':
+            cout << "You are a Female\n";
+        break;
+
+        default:
+            cout << "Invalid gender please try again\n";
+    }
+    return 0;
+}

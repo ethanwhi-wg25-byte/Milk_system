@@ -1,0 +1,33 @@
+#include <iostream>
+#include <iomanip>
+
+using namespace std;
+
+int main(){
+    //t = years
+    //r = interest rate 
+    //P = dollars
+    int t;
+    double r, p;
+    
+    cout << "Please enter your account principle?: ";
+    cin >> p;
+    
+    cout <<"Please enter the number the years of your investment?: ";
+    cin >> t;
+    
+    cout <<"Please enter annual interest rate: " ;
+    cin >> r;
+    
+    r = r / 100;
+    
+    double I = p * r * t;
+    double A = p + I;
+    
+    cout <<"After" << t << "years" << endl 
+         <<"The interest you will earn is RM" << I << endl
+         <<"The total amount of account is RM" << A ;
+         
+    return 0;
+    
+}

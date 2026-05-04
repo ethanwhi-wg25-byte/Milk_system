@@ -1,0 +1,19 @@
+#include <iostream>
+using namespace std;
+
+int main (){
+
+int start_num, end_num;
+
+cout << " Enter the starting value ";
+cin >> start_num;
+
+cout << " Enter the ending value ";
+cin >> end_num;
+
+for (int N = start_num ; N <= end_num ; N += 1)
+
+cout << N << "\t";
+cout << "\n";
+     return 0;
+}

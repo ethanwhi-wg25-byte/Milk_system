@@ -1,0 +1,20 @@
+#include <iostream>
+#include <iomanip>
+using namespace std;
+
+int main(){
+    double num, sum = 0.0, avg;
+    int i = 1;
+    
+    while (i <= 10){
+    cout << "Enter number" << i << ": ";
+    cin >> num;
+    sum += num;
+    i++;
+    }
+
+avg = sum / 10.0;
+cout << "Average = " << avg << endl;
+
+return 0;
+}

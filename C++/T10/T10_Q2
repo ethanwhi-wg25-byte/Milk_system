@@ -1,0 +1,17 @@
+#include <iostream>
+using namespace std;
+
+int main(){
+
+ double x[6]={100 ,25 , 12.75, 20.4, 62.12, 10.1};
+ double smallest = x[0];
+
+    for(int i = 1; i < 6;  i++){
+        if (x[i] < smallest){
+            smallest = x[i];
+        }
+
+    }
+    cout << "smallest = " << smallest << "\n";
+
+}

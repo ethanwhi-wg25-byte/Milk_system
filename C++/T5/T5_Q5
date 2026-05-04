@@ -1,0 +1,18 @@
+#include <iostream>
+using namespace std;
+
+int main(){
+
+    double d1, d2;
+    cout << " Enter the first number :";
+    cin >> d1 ;
+    cout << " Enter the two different doubles :";
+    cin >> d2;
+
+    if (d1 > d2)
+        cout << " The first number is larger " ;
+    else if (d2 > d1)
+        cout << " The second numberis latger";
+    return 0;
+
+}

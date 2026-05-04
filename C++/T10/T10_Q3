@@ -1,0 +1,105 @@
+// #include <iostream>
+// using namespace std;
+
+// int main(){
+//     int n;
+//     cout<<"Enter number of integers:";
+//     cin>>n;
+//     if(n<=0||n>300){
+//         cout<<"cannot less than 0 or more tan 300";
+
+//     }
+
+//     int arr[n];
+//     int value;
+//     for(int i=0;i<n;i++){
+//      cout<<"Enter value"<<i+1<<":";
+//      cin>>value;
+//      arr[i]=value;
+//     }
+//     int maximun=arr[0];
+//     int th= 1;
+//     for(int i=1;i<n;i++){ 
+//          if(arr[i]>maximun){
+//             maximun=arr[i];
+//              th=i+1;
+//          }
+
+//     }
+
+//     int total=0;
+//     for(int i=0;i<n;i++){
+//         total+=arr[i];
+//     }
+//     double average=total/n;
+//     int count=0;
+//     for(int i=0;i<n;i++){
+//         if(arr[i]>average){
+//           count++;
+//         }
+//     }
+//     cout<<"\n\nMaximun:"<<maximun<<endl;
+//     cout<<"It is "<<th<<"th value\n";
+//     cout<<"Average:"<<average<<endl;
+//     cout<<"It is has "<<count<<" value greater the average\n";
+// }
+    
+
+
+
+#include <iostream>
+using namespace std;
+ int main(){
+
+    int num;
+    while(true){
+        cout << "Enter your number of interger: ";
+        cin >> num;
+        if( num < 1 || num > 300){
+         
+          cout << "Cannot be less than 1 or greater than 300" << endl;
+          cout << "please type again" << endl;
+
+        }else{
+             break;
+        }
+
+        
+    }
+    
+    
+    
+    int array[num], value;
+    for(int i = 0; i < num; i++){
+        cout << "Enter your value" << i+1 << ": ";
+        cin >> value ;
+        array[i] = value;
+    }
+    int maxim = array[0], th = 1 ;
+    for(int m = 1; m < num; m++){
+        if(array[m] > maxim){
+            maxim = array[m];
+            th = m+1;
+        }
+    }
+
+    int total = 0;
+    for(int i=0; i<num; i++){
+        total += array[i];
+    }
+
+    double average = total / num;
+
+    int count=0;
+    for(int i = 0; i < num ; i++){
+        if(array[i] > average){
+        count++;
+        }
+    }
+
+    cout << "Maximun: " << maxim << endl 
+         << "It is " << th << "th value " << endl
+         << "Average: " << average << endl
+         << "It has " << count << " value above the average";
+
+}

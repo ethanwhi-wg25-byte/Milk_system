@@ -1,0 +1,24 @@
+#include <iostream>
+#include <iomanip>
+using namespace std;
+ 
+int main(){
+        double price, mpg, miles, gallons,totalcost ; 
+         
+        
+        cout << " Enter miles per gallons :  " ;
+        cin >> mpg;
+        
+        cout << " Enter the miles you've traveled : ";
+        cin >> miles;
+
+        cout << " Enter the current price : ";
+        cin >> price;
+
+        gallons = miles /mpg;
+        totalcost = gallons * price;
+
+        cout << " the cost of filling up the tank is RM: " << totalcost ;
+
+        return 0;
+}

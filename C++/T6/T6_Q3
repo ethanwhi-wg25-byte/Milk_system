@@ -1,0 +1,26 @@
+#include <iostream>
+using namespace std;
+
+int main(){
+    int wind_speed;
+    cout << "What is the wind speed? : ";
+    cin >> wind_speed;
+
+    if (wind_speed < 25){
+        cout << "Not a strong wind\n";
+    }
+    else if (wind_speed <=38){
+        cout << "Strong Wind\n";
+    }
+    else if (wind_speed <=54){
+        cout << "Gale\n";
+    }
+    else if (wind_speed <=72){
+        cout << "Whole gale\n";
+    }
+    else {
+        cout << "Hurricane!!!\n";
+    }
+    return 0;
+
+}

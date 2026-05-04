@@ -1,0 +1,13 @@
+switch (ch)
+    case A:
+        a_grade++
+    break
+    case B:
+        b_grade++
+    break
+    case C:
+        c_grade++
+    case D:
+        d_grade++
+    default
+        f_grade++:

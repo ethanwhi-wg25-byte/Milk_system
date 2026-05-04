@@ -1,0 +1,17 @@
+#include <iostream>
+using namespace std;
+
+int main() {
+    
+    const int CONSTANT = 10;
+    int integer;
+
+    cout << "Enter an integer ";
+    cin >> integer;
+
+    if (integer > CONSTANT)
+        cout << "The number entered is larger than CONSTANT";
+    else 
+        cout << "The number entered is not larger than CONSTANT";
+    return 0;
+}

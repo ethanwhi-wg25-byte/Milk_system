@@ -1,0 +1,37 @@
+#include <iostream>
+using namespace std;
+
+int main(){
+    int age, month;
+    cout << "Enter yout age in years ";
+    while(!(cin >> age)){
+        cout << "invalid input\n";
+        cin >> age;
+    }
+
+    cout << "Enter yout age in months " ;
+    while(!(cin >> month)){
+        cout <<"invalid input\n";
+        cin >> month;
+    }
+
+    while (month < 0 || month >= 12){
+        cout << "Invalid input\n";
+        cout << "Months" ;
+        cin >> month;
+    }
+
+    age *= 12;
+    month += age ;
+
+
+    if (month > 500){
+        cout << month << "***\n";
+    }
+        else {
+            cout << month << "\n";
+        }
+
+    return 0;
+
+}

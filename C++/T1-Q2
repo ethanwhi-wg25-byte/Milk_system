@@ -1,0 +1,21 @@
+#include <iostream>
+#include <iomanip>
+using namespace std;   
+
+
+int main(){
+  
+   int x =100;
+   char c = 'T';
+   double y = 3.1415927;
+
+
+   cout << x << endl
+        << c << endl
+        << setprecision(8) << y << endl;
+        
+   return 0;
+}
+
+//<< setprecision << = significant digits
+//<< fixed  <<setprecision << = decimal places

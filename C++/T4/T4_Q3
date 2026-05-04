@@ -1,0 +1,63 @@
+// #include <iostream>
+// #include <iomanip>
+// using namespace std;
+
+// int main(){
+//     double net_salary,net_salary2,net_salary3, rate;
+
+//     cout << "Enter you annual salary: Rm";
+//     cin >> net_salary;
+
+//     cout << "Enter yout estimated growth: Rm";
+//     cin >> rate;
+
+//     rate = rate/100;
+//     net_salary += net_salary * rate;
+//     net_salary2=net_salary;
+//     net_salary2 += net_salary2 * rate;
+//     net_salary3=net_salary2;
+//     net_salary3 += net_salary3 *rate;
+
+//     cout << fixed << setprecision(2) 
+//          << "Year 1:Rm " << net_salary <<endl
+//          << "Year 2:Rm " << net_salary2 <<endl
+//          << "Year 3:Rm " << net_salary3 <<endl;
+//     return 0;
+
+
+
+// }
+
+#include <iostream>
+#include <iomanip>
+using namespace std;
+
+int main(){
+    double salary, growrate;
+
+    cout << "Enter you annual salary: Rm";
+    cin >> salary;
+
+    cout << "Enter yout estimated growth: Rm";
+    cin >> growrate;
+
+    growrate = growrate/100; 
+    salary += growrate * salary;
+   
+    cout  << "Year 1:Rm " << salary <<endl;
+
+    salary += growrate * salary;
+
+    cout  << "Year 2:Rm " << salary <<endl;
+
+    salary += growrate * salary;
+
+    cout  << "Year 3:Rm " << salary <<endl;
+  
+    return 0;
+
+
+
+}
+
+

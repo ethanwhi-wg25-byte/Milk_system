@@ -1,0 +1,34 @@
+#include <iostream>
+#include <iomanip>
+using namespace std;
+
+int main(){
+    double s_t , i_t, e_t;
+    double alt,v_t;
+
+    cout << "Enter initial value for table (in hours): ";
+    cin >> s_t;
+
+    cout << "Enter increment between lines (in hours): ";
+    cin >> i_t;
+
+    cout << "Enter final value for table (in hours):  ";
+    cin >> e_t;
+
+    cout << showpoint << left << endl;
+    cout << setw(12) << "Weather" << setw(15) << "Ballon" << setw(15) << "Information" << endl;
+    cout << setw (12) << "Time" << setw(15) << "Height" << setw(15) << "Velocity" << endl;
+    cout << setw(12) << "(hr)" << setw(15) << "(m)" << setw(15) << "(m/s)" << endl; 
+
+    for ( double t = s_t ;t <= e_t ; t += i_t ){
+
+    alt = -0.12*pow(t,4) + 12*pow(t,3) - (380*pow(t,2)) +4100*t +220;
+    v_t= -0.48*pow(t,3) + 36*pow(t, 2) -760*t + 4100;
+    v_t /=3600;
+
+    cout << setw(12) << setprecision (4) << t
+         << setw(15) << setprecision (6) << alt
+         << setw(15) << setprecision(6) << v_t << endl;
+
+    }
+}

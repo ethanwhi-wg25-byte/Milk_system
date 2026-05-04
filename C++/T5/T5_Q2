@@ -1,0 +1,41 @@
+a)if ( time > 15)
+    time += 1
+
+b)if (sqrt(poly) < 0.5)
+    cout << "the value of poly is " << poly;
+
+c) if (volt_1 - volt_2 > 10|| volt_2 - volt_1)
+    cout << voult_1 << volt_2;
+
+d) if (log(x) >= 3)
+    {
+        time = 0
+        count --
+    }
+
+e)if (dist < 50 && time >= 10)
+        time += 2;
+  else 
+        time +=2.5;
+
+f)if ( income > 20000.00 && income < 25000.00)
+    tax_rate = 0.225
+
+g) if (dist >= 100)
+        time += 2;
+   else if (dist >=50 && dist <=100)
+        time += 1;
+   else 
+        time += 0.5;
+
+h) if (quantity_on_hand > 200)
+    below_level += 1;
+       cout << " Quantity on hand is low"
+   else 
+       cout << "Quantity on hand is acceptable"
+
+i) if (age > 18)
+    dues == 2.50 + 0.5 * (age -18);
+   else 
+     dues = 2.50;
+

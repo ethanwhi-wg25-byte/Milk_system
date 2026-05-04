@@ -1,0 +1,21 @@
+#include <iostream>
+using namespace std;
+
+int main (){
+    char gender;
+    cout << "Please enter your gender(M/F) : ";
+    cin >> gender;
+
+    if ((gender == 'M') || (gender == 'm'))
+    {
+        cout << "You are Male\n";
+    }
+    else if ((gender == 'F') || (gender == 'f'))
+    {
+        cout << "You are a Female\n";
+    }
+    else {
+        cout << "Invalid gender please try again\n";
+    }
+    return 0;
+}

@@ -1,0 +1,25 @@
+#include <iostream>
+using namespace std;
+
+int main(){
+    char chr;
+    cout << "Enter a single character: ";
+    cin >> chr;
+    
+    if (( chr >='A' && chr <= 'Z')
+        cout << "This is an Alphabet\n" << endl 
+             << "The character " << chr << " is a uppercase";
+    
+    else if ((chr >='a' && chr <= 'z')){
+        cout << "This is an Alphabet"
+             <<"The character " << chr << " is a lowercase";
+    }
+    else 
+        cout << "this is noa a Alphabet"
+
+    return 0;
+}
+
+
+
+//if ((ch >= 'A' && ch <='Z') || (ch >='a' && ch <='z'))
